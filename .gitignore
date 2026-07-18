@@ -1,0 +1,10 @@
+# Environments / caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Training and evaluation artifacts (regenerable; checkpoints are ~6MB each)
+runs/
+*.log
+*.err
