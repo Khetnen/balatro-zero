@@ -323,13 +323,20 @@ def scripted_econ_action(gs, legal: list[FactoredAction] | None = None) -> Facto
                         return a
         if FLAGS["planet_discipline"]:
             # Sell held off-build consumables (frees slots, feeds interest).
+            # Keep at most ONE targeted tarot: a full rack of them blocks
+            # Soul pickups (observed on god seeds — the whole point missed).
             keep = USE_PLANETS | {"c_soul", "c_hermit", "c_temperance"}
-            if FLAGS["tarot_targeting"]:
-                keep |= TARGETED_TAROTS
+            tarots_kept = 0
             for a in by_type[ActionType.SellConsumable]:
-                if a.entity_target is not None and a.entity_target < len(cons):
-                    if key_of(cons[a.entity_target]) not in keep:
-                        return a
+                if a.entity_target is None or a.entity_target >= len(cons):
+                    continue
+                k = key_of(cons[a.entity_target])
+                if k in keep:
+                    continue
+                if FLAGS["tarot_targeting"] and k in TARGETED_TAROTS and tarots_kept < 1:
+                    tarots_kept += 1
+                    continue
+                return a
         elif len(cons) >= 2 and not any(key_of(c) == "c_soul" for c in cons):
             if by_type[ActionType.SellConsumable]:
                 return by_type[ActionType.SellConsumable][0]
