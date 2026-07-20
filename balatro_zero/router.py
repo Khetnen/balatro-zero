@@ -95,6 +95,21 @@ if _flags_env is not None:
     FLAGS = {k: (k in _on) for k in FLAGS}
 
 
+from contextlib import contextmanager as _contextmanager
+
+
+@_contextmanager
+def flags_override(**kw):
+    """Temporarily override FLAGS (e.g. the gold probe forcing peek=True)."""
+    old = dict(FLAGS)
+    FLAGS.update(kw)
+    try:
+        yield
+    finally:
+        FLAGS.clear()
+        FLAGS.update(old)
+
+
 def interest_reserve(gs) -> int:
     """Dollars to protect for interest ($1 per $5 held, capped at $25).
 

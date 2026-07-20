@@ -148,6 +148,11 @@ def run_probe_game(spec: ProbeSpec, seed: str, rollout: int) -> dict[str, Any]:
             seed, rng, spec.params["ckpt"],
             int(spec.params.get("sims", 32)), int(spec.params.get("depth", 1)),
         )
+    elif spec.kind == "gold":
+        from balatro_zero.goldprobe import gold_game
+
+        g = gold_game(seed, econ_eps=spec.params.get("eps", 0.05), rng=rng)
+        out = {k: g[k] for k in ("won", "max_ante", "progress", "moves")}
     else:
         raise ValueError(f"unknown probe kind {spec.kind!r}")
     out.update({"probe": spec.name, "seed": seed, "rollout": rollout})
