@@ -79,6 +79,10 @@ FLAGS = {
 
 def _pick_rank(k: str) -> int:
     """Value of a pack-openable item to the flush build."""
+    if k in PLAN["priority_buys"]:
+        return 50
+    if k in PLAN["avoid_buys"]:
+        return 1
     return (
         100 if k == "c_soul"
         else 60 if k == "c_black_hole"
@@ -96,6 +100,25 @@ if _flags_env is not None:
 
 
 from contextlib import contextmanager as _contextmanager
+
+# Per-seed build plan (set via plan_override): seed-specific purchase
+# priorities authored by an LLM from a scouted shop/pack future.
+PLAN: dict = {"priority_buys": (), "avoid_buys": ()}
+
+
+@_contextmanager
+def plan_override(plan: dict | None):
+    old = dict(PLAN)
+    if plan:
+        PLAN.update({
+            "priority_buys": tuple(plan.get("priority_buys", ())),
+            "avoid_buys": tuple(plan.get("avoid_buys", ())),
+        })
+    try:
+        yield
+    finally:
+        PLAN.clear()
+        PLAN.update(old)
 
 
 @_contextmanager
@@ -375,6 +398,10 @@ def scripted_econ_action(gs, legal: list[FactoredAction] | None = None) -> Facto
                 else 1 if k in ECON_TAROTS
                 else 0
             )
+            if k in PLAN["priority_buys"]:
+                rank = max(rank, 5)
+            elif k in PLAN["avoid_buys"]:
+                rank = 0
             if rank in (3, 4) and dollars - cost < reserve - 10:
                 rank = 0
             elif rank in (1, 2) and dollars - cost < reserve:

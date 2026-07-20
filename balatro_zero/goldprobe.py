@@ -308,13 +308,15 @@ def econ_action_by_rollout(gs) -> FactoredAction | None:
     return best or scripted
 
 
-def gold_game(seed: str, econ_eps: float = 0.0, rng=None) -> dict:
+def gold_game(seed: str, econ_eps: float = 0.0, rng=None, plan: dict | None = None) -> dict:
     """Play one full clairvoyant game; returns outcome stats."""
     import numpy as np
 
+    from balatro_zero.router import plan_override
+
     if rng is None:
         rng = np.random.default_rng(0)
-    with flags_override(peek=True, skip_tags=False):
+    with flags_override(peek=True, skip_tags=False), plan_override(plan):
         gs = new_run(seed)
         moves = 0
         max_ante = ante(gs)
