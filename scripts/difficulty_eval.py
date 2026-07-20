@@ -27,11 +27,13 @@ ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 DEFAULT_PROBES = [
     ProbeSpec("chip_greedy", "chip_greedy", {"eps": 0.05}),
-    ProbeSpec("v1_it40_s16", "net", {"ckpt": "runs/v1/ckpt_0040.pt", "sims": 16, "depth": 1}),
     ProbeSpec("v6_s16", "net", {"ckpt": "runs/v6/latest.pt", "sims": 16, "depth": 1}),
     ProbeSpec("v10_s16", "net", {"ckpt": "runs/v10/latest.pt", "sims": 16, "depth": 1}),
     ProbeSpec("v10_s64", "net", {"ckpt": "runs/v10/latest.pt", "sims": 64, "depth": 1}),
+    ProbeSpec("router_e30", "router", {"eps": 0.30}),   # mid-rung: degraded expert
+    ProbeSpec("router_e15", "router", {"eps": 0.15}),   # mid-rung
     ProbeSpec("router", "router", {"eps": 0.05}),
+    ProbeSpec("gold", "gold", {"eps": 0.05}),           # top rung: win boundary
 ]
 
 
