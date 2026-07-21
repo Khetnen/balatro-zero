@@ -30,7 +30,7 @@ from balatro_zero.state import (
     won,
 )
 
-STATE = Path("runs/interactive/state.pkl")
+STATE = Path("runs/interactive/state.pkl")  # default; override with --state
 
 DECISION_TYPES = {
     int(ActionType.BuyCard), int(ActionType.RedeemVoucher),
@@ -169,8 +169,12 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--new", type=str, default=None)
     ap.add_argument("--act", type=int, default=None)
+    ap.add_argument("--state", type=str, default=None)
     args = ap.parse_args()
 
+    global STATE
+    if args.state:
+        STATE = Path(args.state)
     STATE.parent.mkdir(parents=True, exist_ok=True)
     if args.new:
         gs = new_run(args.new)
