@@ -93,8 +93,19 @@ def summary(gs) -> str:
     tags = rr.get("blind_tags", {})
     if tags:
         lines.append(f"skip tags: {tags}")
+    def _card_label(c) -> str:
+        ed = getattr(c, "edition", None)
+        ed_s = ""
+        if ed:
+            if isinstance(ed, dict):
+                ed_s = "/".join(k for k, v in ed.items() if v and k != "type")
+                ed_s = ed_s or str(ed.get("type", ""))
+            else:
+                ed_s = str(ed)
+        return f"{key_of(c)}[{ed_s}]" if ed_s else key_of(c)
+
     lines.append(
-        "board: " + (", ".join(key_of(c) for c in gs.get("jokers", [])) or "(empty)")
+        "board: " + (", ".join(_card_label(c) for c in gs.get("jokers", [])) or "(empty)")
     )
     lines.append(
         "consumables: " + (", ".join(key_of(c) for c in gs.get("consumables", [])) or "(none)")
@@ -135,6 +146,22 @@ def advance(gs) -> list:
             guard += 1
             phase = gs.get("phase")
             if phase == GamePhase.SELECTING_HAND:
+                # Fire held enhancement tarots at blind start: their payoff is
+                # cross-blind, so the within-blind beam never chooses them
+                # (no immediate chips -> pruned). Observed as slot-clog in
+                # fresh-agent runs.
+                from balatro_zero.router import targeted_tarot_action
+
+                fired = 0
+                while fired < 2:
+                    t = targeted_tarot_action(gs)
+                    if t is None:
+                        break
+                    try:
+                        step_factored(gs, t)
+                        fired += 1
+                    except Exception:  # noqa: BLE001
+                        break
                 seq = plan_blind(gs)
                 if not seq:
                     legal = legal_factored(gs)
