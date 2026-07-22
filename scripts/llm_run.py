@@ -38,6 +38,10 @@ drawn cards and the beam's intended action; answer with ONE command:
   clear constraints
 Constraints persist across blinds until cleared — use them for jokers like \
 Obelisk (veto your most-played hand) or Card Sharp (require one type).
+Duplicate consumables/pack cards take a #N suffix (use c_strength#2 on Td).
+The PASS option shows a whole-blind projection: [proj: CLEARS ...] means the \
+beam alone wins the blind; [proj: DIES at X/Y] means steer NOW (pins, tarots, \
+constraints) or the blind is lost — do the pace math before passing.
 
 Key setup facts: board capacity 5 jokers (+1 per Negative), 2 consumable \
 slots, interest +$1 per $5 held (max $5). Suit-converter and card-targeting \

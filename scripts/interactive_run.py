@@ -168,7 +168,7 @@ def describe(gs, a) -> str:
             hl = hand_labels(gs)
             extra = " on " + " ".join(
                 hl[j] if j < len(hl) else str(j) for j in a.card_target)
-        return f"PICK {key_of(items[i]) if i is not None and i < len(items) else '?'}{extra}"
+        return f"PICK {card_label(items[i]) if i is not None and i < len(items) else '?'}{extra}"
     if t == ActionType.SellJoker:
         return f"SELL {sell_at('jokers', a.entity_target)}"
     if t == ActionType.SellConsumable:
@@ -213,7 +213,24 @@ def summary(gs, ctl) -> str:
     )
     choices = rr.get("blind_choices", {})
     if choices:
-        lines.append(f"blinds this ante: {choices}")
+        try:
+            from jackdaw.engine.blind import Blind
+
+            parts = []
+            for k in ("Small", "Big", "Boss"):
+                bk = choices.get(k)
+                if not bk:
+                    continue
+                b = Blind.create(
+                    bk,
+                    rr.get("ante", 1),
+                    scaling=gs.get("modifiers", {}).get("scaling", 1),
+                    ante_scaling=gs.get("starting_params", {}).get("ante_scaling", 1.0),
+                )
+                parts.append(f"{k}={bk}@{b.chips}")
+            lines.append("blinds this ante: " + " ".join(parts))
+        except Exception:  # noqa: BLE001
+            lines.append(f"blinds this ante: {choices}")
     tags = rr.get("blind_tags", {})
     if tags:
         lines.append(f"skip tags: {tags}")
@@ -258,7 +275,7 @@ def summary(gs, ctl) -> str:
             + "]"
         )
     if gs.get("phase") == GamePhase.PACK_OPENING:
-        lines.append("pack contents: " + ", ".join(key_of(c) for c in gs.get("pack_cards", [])))
+        lines.append("pack contents: " + ", ".join(card_label(c) for c in gs.get("pack_cards", [])))
         if gs.get("hand"):
             lines.append("dealt (tarot targets, `pick X on <cards>`): "
                          + " ".join(hand_labels(gs)))
@@ -287,6 +304,35 @@ def _constraints(ctl) -> dict | None:
     return None
 
 
+def _project_plan(gs, seq) -> str:
+    """Simulate the beam's whole-blind plan and report the outcome, so a
+    doomed blind is visible at the stop where steering is still possible
+    (the beam itself degrades to greedy extraction when no clearing line
+    exists and never signals it)."""
+    from balatro_zero.state import clone
+
+    if not seq:
+        return ""
+    sim = clone(gs)
+    start_round = sim.get("round", 0)
+    for a in seq:
+        try:
+            step_factored(sim, a)
+        except Exception:  # noqa: BLE001
+            break
+        if is_terminal(sim) or won(sim) or sim.get("round", 0) > start_round:
+            break
+    blind = gs.get("blind")
+    target = getattr(blind, "chips", 0) if blind else 0
+    if won(sim) or sim.get("round", 0) > start_round:
+        hl = sim.get("current_round", {}).get("hands_left", 0)
+        return f" [proj: CLEARS, {hl} hands left]"
+    if is_terminal(sim):
+        return (f" [proj: DIES at {sim.get('chips', 0)}/{target}"
+                " - steer (pins/tarots) or accept]")
+    return f" [proj: {sim.get('chips', 0)}/{target} after plan]"
+
+
 def _hand_options(gs, ctl) -> list[dict]:
     seq = plan_blind(gs, _constraints(ctl))
     first = seq[0] if seq else None
@@ -296,7 +342,8 @@ def _hand_options(gs, ctl) -> list[dict]:
     opts = []
     if first is not None:
         opts.append({"kind": "pass", "action": first,
-                     "desc": f"PASS - beam: {describe(gs, first)}"})
+                     "desc": f"PASS - beam: {describe(gs, first)}"
+                             + _project_plan(gs, seq)})
     opts.append({"kind": "auto", "action": None,
                  "desc": "AUTO - beam finishes this blind"})
     for a in legal_factored(gs):
@@ -370,14 +417,35 @@ def advance(gs, ctl) -> tuple[str, list]:
 # ---------------------------------------------------------------------------
 
 
-def _find_consumable(gs, token: str) -> int | None:
-    matches = [i for i, c in enumerate(gs.get("consumables", []))
-               if token.lower() in key_of(c).lower()]
-    if len(matches) != 1:
-        print(f"consumable {token!r}: {len(matches)} matches "
-              f"({[key_of(c) for c in gs.get('consumables', [])]})")
+def _find_card(items: list, token: str, what: str) -> int | None:
+    """Resolve a key-substring token (with optional #N for duplicates)
+    to an index into *items*. Duplicates of the SAME key resolve to the
+    Nth copy (default first); substrings spanning different keys are
+    ambiguous and refused."""
+    t = token.lower()
+    n = 1
+    if "#" in t:
+        t, _, num = t.partition("#")
+        if not num.isdigit() or int(num) < 1:
+            print(f"bad #suffix in {token!r}")
+            return None
+        n = int(num)
+    matches = [i for i, c in enumerate(items) if t in key_of(c).lower()]
+    if not matches:
+        print(f"no {what} matches {token!r} ({[key_of(c) for c in items]})")
         return None
-    return matches[0]
+    if len({key_of(items[i]) for i in matches}) > 1:
+        print(f"ambiguous {what} {token!r}: "
+              + ", ".join(key_of(items[i]) for i in matches))
+        return None
+    if n > len(matches):
+        print(f"{token!r}: only {len(matches)} cop{'y' if len(matches) == 1 else 'ies'} held")
+        return None
+    return matches[n - 1]
+
+
+def _find_consumable(gs, token: str) -> int | None:
+    return _find_card(gs.get("consumables", []), token, "consumable")
 
 
 def _parse_hand_types(text: str) -> list[str] | None:
@@ -563,18 +631,14 @@ def apply_act(gs, ctl, kind: str, opts: list[dict], act: str,
         return "ORDER" if _order_jokers(gs, m.group(1)) else None
     if m := re.match(r"^pick\s+(\S+)\s+on\s+(.+)$", act.strip(), re.I):
         # Targeted pack pick: a card-targeting tarot fired at dealt cards.
-        items = gs.get("pack_cards", [])
-        hits = [i for i, c in enumerate(items)
-                if m.group(1).lower() in key_of(c).lower()]
-        if len(hits) != 1:
-            print(f"pack card {m.group(1)!r}: {len(hits)} matches "
-                  f"({[key_of(c) for c in items]})")
+        hit = _find_card(gs.get("pack_cards", []), m.group(1), "pack card")
+        if hit is None:
             return None
         idxs = parse_card_tokens(gs, m.group(2))
         if idxs is None:
             return None
         a = FactoredAction(action_type=int(ActionType.PickPackCard),
-                           entity_target=hits[0],
+                           entity_target=hit,
                            card_target=tuple(sorted(idxs)))
         try:
             entry = describe(gs, a)
@@ -640,7 +704,8 @@ def main() -> None:
             print(f"  [{i}] {o['desc']}")
         if kind == "hand":
             print("  (free-form: play/discard <cards>, use <cons> [on <cards>], "
-                  "copy A onto B, order jokers .., veto/require <hand types>, clear)")
+                  "copy A onto B, order jokers .., veto/require <hand types>, clear; "
+                  "#2 picks duplicate consumables/pack cards)")
     STATE.write_bytes(pickle.dumps((gs, moves, ctl), protocol=5))
     Path(str(STATE) + ".opts").write_bytes(pickle.dumps((kind, opts), protocol=5))
 
