@@ -163,7 +163,11 @@ def describe(gs, a) -> str:
     if t == ActionType.PickPackCard:
         items = gs.get("pack_cards", [])
         i = a.entity_target
-        extra = f" targets={a.card_target}" if a.card_target else ""
+        extra = ""
+        if a.card_target:
+            hl = hand_labels(gs)
+            extra = " on " + " ".join(
+                hl[j] if j < len(hl) else str(j) for j in a.card_target)
         return f"PICK {key_of(items[i]) if i is not None and i < len(items) else '?'}{extra}"
     if t == ActionType.SellJoker:
         return f"SELL {sell_at('jokers', a.entity_target)}"
@@ -255,6 +259,9 @@ def summary(gs, ctl) -> str:
         )
     if gs.get("phase") == GamePhase.PACK_OPENING:
         lines.append("pack contents: " + ", ".join(key_of(c) for c in gs.get("pack_cards", [])))
+        if gs.get("hand"):
+            lines.append("dealt (tarot targets, `pick X on <cards>`): "
+                         + " ".join(hand_labels(gs)))
     if gs.get("phase") == GamePhase.SELECTING_HAND:
         cr = gs.get("current_round", {})
         blind = gs.get("blind")
@@ -554,6 +561,28 @@ def apply_act(gs, ctl, kind: str, opts: list[dict], act: str,
     # econ stop
     if m := re.match(r"^order\s+jokers?\s+(.+)$", act.strip(), re.I):
         return "ORDER" if _order_jokers(gs, m.group(1)) else None
+    if m := re.match(r"^pick\s+(\S+)\s+on\s+(.+)$", act.strip(), re.I):
+        # Targeted pack pick: a card-targeting tarot fired at dealt cards.
+        items = gs.get("pack_cards", [])
+        hits = [i for i, c in enumerate(items)
+                if m.group(1).lower() in key_of(c).lower()]
+        if len(hits) != 1:
+            print(f"pack card {m.group(1)!r}: {len(hits)} matches "
+                  f"({[key_of(c) for c in items]})")
+            return None
+        idxs = parse_card_tokens(gs, m.group(2))
+        if idxs is None:
+            return None
+        a = FactoredAction(action_type=int(ActionType.PickPackCard),
+                           entity_target=hits[0],
+                           card_target=tuple(sorted(idxs)))
+        try:
+            entry = describe(gs, a)
+            step_factored(gs, a)
+            return entry
+        except Exception as e:  # noqa: BLE001
+            print(f"ILLEGAL ({e}); state unchanged")
+            return None
     i = resolve_act([o["desc"] for o in opts], act, expect)
     if i is None:
         return None
