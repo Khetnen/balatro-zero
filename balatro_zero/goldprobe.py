@@ -115,12 +115,42 @@ def _discard_candidates(gs) -> list[FactoredAction]:
     return out
 
 
-def _expand(node: _Node, start_round: int) -> list[tuple[FactoredAction, dict]]:
+def _filter_plays(gs, plays: list[FactoredAction], constraints: dict) -> list[FactoredAction]:
+    """Drop plays whose hand type violates veto/require constraints.
+
+    Classification uses the engine evaluator (respects Four Fingers /
+    Shortcut / Smeared). Returns [] if nothing survives — the caller
+    falls back to unconstrained plays, so constraints can never wedge
+    a blind."""
+    veto = set(constraints.get("veto") or ())
+    require = set(constraints.get("require") or ())
+    if not veto and not require:
+        return plays
+    from jackdaw.engine.hand_eval import evaluate_hand
+
+    hand = gs.get("hand", [])
+    jokers = gs.get("jokers", [])
+    out = []
+    for a in plays:
+        cards = [hand[i] for i in a.card_target if i < len(hand)]
+        ht = evaluate_hand(cards, jokers).detected_hand
+        if ht in veto or (require and ht not in require):
+            continue
+        out.append(a)
+    return out
+
+
+def _expand(
+    node: _Node, start_round: int, constraints: dict | None = None
+) -> list[tuple[FactoredAction, dict]]:
     gs = node.gs
     succ: list[tuple[float, FactoredAction, dict]] = []
     # Plays: simulate all candidates, keep the best few.
     plays: list[tuple[float, FactoredAction, dict]] = []
-    for a in _play_candidates(gs):
+    candidates = _play_candidates(gs)
+    if constraints:
+        candidates = _filter_plays(gs, candidates, constraints) or candidates
+    for a in candidates:
         sim = clone(gs)
         try:
             step_factored(sim, a)
@@ -145,8 +175,12 @@ def _expand(node: _Node, start_round: int) -> list[tuple[FactoredAction, dict]]:
     return [(a, sim) for _, a, sim in succ]
 
 
-def plan_blind(gs) -> list[FactoredAction]:
-    """Beam-search the current blind; return the best action sequence."""
+def plan_blind(gs, constraints: dict | None = None) -> list[FactoredAction]:
+    """Beam-search the current blind; return the best action sequence.
+
+    *constraints*: optional {"veto": [hand types], "require": [hand types]}
+    steering which hand types the beam may play (falls back to
+    unconstrained when nothing legal survives)."""
     start_round = gs.get("round", 0)
     frontier = [_Node(clone(gs))]
     best_leaf: _Node | None = None
@@ -155,7 +189,7 @@ def plan_blind(gs) -> list[FactoredAction]:
     for _ in range(MAX_DEPTH):
         children: list[_Node] = []
         for node in frontier:
-            for action, sim in _expand(node, start_round):
+            for action, sim in _expand(node, start_round, constraints):
                 terminal, score = _leaf_score(sim, start_round)
                 child = _Node(sim, node.seq + [action], score)
                 if terminal:

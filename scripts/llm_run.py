@@ -1,6 +1,7 @@
-"""Local-LLM Balatro strategist: a chat model makes every econ decision;
-the beam plays hands. Works with any OpenAI-compatible endpoint
-(Ollama, LM Studio, vLLM).
+"""Local-LLM Balatro strategist: a chat model makes every strategy decision
+(econ stops AND per-hand watch stops); the beam handles residual chip
+extraction. Works with any OpenAI-compatible endpoint (Ollama, LM Studio,
+vLLM).
 
 Usage (from balatro-zero/):
     uv run --no-sync python scripts/llm_run.py SEED [--model qwen2.5:7b]
@@ -10,39 +11,48 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 import urllib.request
 
 sys.path.insert(0, "scripts")
-from interactive_run import advance, describe, summary  # noqa: E402
+from interactive_run import CTL0, advance, apply_act, summary  # noqa: E402
 
-from balatro_zero.state import ante, is_terminal, new_run, progress, won, step_factored  # noqa: E402
-from jackdaw.env.action_space import ActionType  # noqa: E402
+from balatro_zero.state import ante, is_terminal, new_run, progress, won  # noqa: E402
 
-SYSTEM = """You are an expert Balatro player making the economy/strategy decisions \
-for a run (Red Deck, White stake). Goal: WIN (beat the ante-8 boss). Hand play is \
-automated by a strong engine; you only pick shop/blind/pack decisions.
+SYSTEM = """You are an expert Balatro player making the strategy decisions \
+for a run (Red Deck, White stake). Goal: WIN (beat the ante-8 boss). A strong \
+engine ("the beam") handles raw chip extraction; you steer it.
 
-Key rules of this setup:
-- Board capacity 5 jokers, 2 consumable slots. Interest +$1 per $5 held (max $5).
-- Suit-converter and card-targeting tarots (Star/Moon/Sun/World/Strength/Lovers...) \
-are NEVER used by the engine - do not buy or pick them (Chariot/Justice/Death/\
-Hanged Man are auto-used; planets from packs apply instantly).
-- You win on scaling: get xmult jokers and hand levels by ante 7; flat +mult \
-commons alone die around ante 4-5. Cheap bodies early beat an empty board.
-- Skip tags: tag_buffoon (free mega joker pack) and tag_investment ($25 after \
-boss) are good when your board is strong; other skips usually waste money.
-- bl_tooth costs $1/card played (~$20/blind); bl_eye forbids repeating hand types.
-Answer with ONLY the option number, optionally followed by a dash and max 8 words."""
+Two kinds of stops. At an ECON stop (shop/blind select/packs), answer with an \
+option number or a unique option-text substring. At a HAND stop you see your \
+drawn cards and the beam's intended action; answer with ONE command:
+  pass                       accept the beam's shown action
+  auto                       let the beam finish this blind
+  play <cards>               e.g.  play Kh Qh 7s   (10s or Ts; Kh#2 for dups)
+  discard <cards>
+  use <consumable> [on <cards>]     e.g.  use c_sixth_sense on 6d
+  copy <card> onto <card>    Death: copies first card onto second (free swaps)
+  order jokers <k1, k2, ..>  reorder board (trigger order; also at shops)
+  veto <hand types>          forbid the beam these hands (e.g. veto Flush)
+  require <hand types>       restrict the beam to these hands
+  clear constraints
+Constraints persist across blinds until cleared — use them for jokers like \
+Obelisk (veto your most-played hand) or Card Sharp (require one type).
+
+Key setup facts: board capacity 5 jokers (+1 per Negative), 2 consumable \
+slots, interest +$1 per $5 held (max $5). Suit-converter and card-targeting \
+tarots CAN now be used at hand stops via `use ... on <cards>`. Planets from \
+packs apply instantly. Skip tags are shown on blind-select options.
+Answer with ONLY the command (or number), optionally followed by a dash and \
+max 8 words of reasoning."""
 
 
 def ask_llm(url: str, model: str, temp: float, state_txt: str, options: list[str],
-            recent: list[str]) -> str:
+            recent: list[str], kind: str) -> str:
     ctx = ("Recent decisions: " + "; ".join(recent[-6:]) + "\n\n") if recent else ""
-    user = (f"{ctx}{state_txt}\n\noptions:\n"
+    user = (f"{ctx}{state_txt}\n\n[{kind.upper()} stop] options:\n"
             + "\n".join(f"  [{i}] {o}" for i, o in enumerate(options))
-            + "\n\nWhich option? Answer with the number.")
+            + "\n\nYour command?")
     body = json.dumps({
         "model": model, "temperature": temp,
         "messages": [{"role": "system", "content": SYSTEM},
@@ -61,48 +71,48 @@ def main() -> None:
     ap.add_argument("--model", default="qwen2.5:7b")
     ap.add_argument("--url", default="http://127.0.0.1:11434/v1/chat/completions")
     ap.add_argument("--temp", type=float, default=0.3)
-    ap.add_argument("--max-decisions", type=int, default=250)
+    ap.add_argument("--max-decisions", type=int, default=400)
     args = ap.parse_args()
 
     gs = new_run(args.seed)
+    ctl = dict(CTL0)
     recent: list[str] = []
     n = 0
     while n < args.max_decisions:
-        opts = advance(gs)
+        kind, opts = advance(gs, ctl)
         if won(gs) or is_terminal(gs) or not opts:
             break
-        state_txt = summary(gs)
-        descs = [describe(gs, a) for a in opts]
-        choice = None
+        state_txt = summary(gs, ctl)
+        descs = [o["desc"] for o in opts]
+        applied = None
         for attempt in range(2):
             try:
-                reply = ask_llm(args.url, args.model, args.temp, state_txt, descs, recent)
+                reply = ask_llm(args.url, args.model, args.temp, state_txt,
+                                descs, recent, kind)
             except Exception as e:  # noqa: BLE001
                 print(f"LLM error: {e}", flush=True)
+                reply = None
                 break
-            m = re.search(r"\d+", reply)
-            if m and 0 <= int(m.group()) < len(opts):
-                choice = int(m.group())
-                print(f"[{n:3d}] LLM({attempt}) -> [{choice}] {descs[choice]}  | {reply[:60]}",
-                      flush=True)
+            act = reply.split("-")[0].strip() if "-" in reply[:40] else reply
+            act = act.splitlines()[0].strip().strip("`\"'")
+            applied = apply_act(gs, ctl, kind, opts, act, None)
+            print(f"[{n:3d}] LLM({attempt}) {kind}: {act!r} -> "
+                  f"{applied if applied is not None else 'REJECTED'}  | {reply[:70]}",
+                  flush=True)
+            if applied is not None:
                 break
-        if choice is None:
-            for want in (ActionType.SelectBlind, ActionType.NextRound, ActionType.SkipPack):
-                idx = next((i for i, a in enumerate(opts) if a.action_type == want), None)
-                if idx is not None:
-                    choice = idx
-                    break
-            choice = 0 if choice is None else choice
-            print(f"[{n:3d}] fallback -> [{choice}] {descs[choice]}", flush=True)
-        recent.append(descs[choice])
-        try:
-            step_factored(gs, opts[choice])
-        except Exception as e:  # noqa: BLE001
-            print(f"step failed: {e}", flush=True)
-            break
+        if applied is None:
+            fallback = "pass" if kind == "hand" else "0"
+            applied = apply_act(gs, ctl, kind, opts, fallback, None)
+            print(f"[{n:3d}] fallback {fallback} -> {applied}", flush=True)
+            if applied is None:
+                print("fallback failed; stopping", flush=True)
+                break
+        if applied:
+            recent.append(applied)
         n += 1
 
-    print("\n" + summary(gs))
+    print("\n" + summary(gs, ctl))
     tag = "WON" if won(gs) else ("GAME OVER" if is_terminal(gs) else "STOPPED")
     print(f"*** {tag}: ante {ante(gs)} prog {progress(gs):.3f} after {n} decisions ***")
 
