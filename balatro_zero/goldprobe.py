@@ -28,6 +28,7 @@ from balatro_zero.router import (
 )
 from balatro_zero.state import (
     ante,
+    blinds_beaten,
     clone,
     is_terminal,
     legal_factored,
@@ -55,13 +56,13 @@ class _Node:
     score: float = 0.0
 
 
-def _leaf_score(gs, start_round: int) -> tuple[bool, float]:
+def _leaf_score(gs, start_beaten: int) -> tuple[bool, float]:
     """(is_terminal_for_blind, score). Higher = better."""
     if won(gs):
         return True, WON_RUN
     if is_terminal(gs):
         return True, DEAD + gs.get("chips", 0)
-    if gs.get("round", 0) > start_round:  # blind defeated (pre-cash-out)
+    if blinds_beaten(gs) > start_beaten:  # blind defeated (pre-cash-out)
         cr = gs.get("current_round", {})
         return True, CLEARED + cr.get("hands_left", 0) * 1e3 + gs.get("dollars", 0)
     return False, float(gs.get("chips", 0))
@@ -141,7 +142,7 @@ def _filter_plays(gs, plays: list[FactoredAction], constraints: dict) -> list[Fa
 
 
 def _expand(
-    node: _Node, start_round: int, constraints: dict | None = None
+    node: _Node, start_beaten: int, constraints: dict | None = None
 ) -> list[tuple[FactoredAction, dict]]:
     gs = node.gs
     succ: list[tuple[float, FactoredAction, dict]] = []
@@ -156,7 +157,7 @@ def _expand(
             step_factored(sim, a)
         except Exception:  # noqa: BLE001
             continue
-        _, s = _leaf_score(sim, start_round)
+        _, s = _leaf_score(sim, start_beaten)
         plays.append((s, a, sim))
     plays.sort(key=lambda t: -t[0])
     succ.extend(plays[:N_PLAY_KEEP])
@@ -170,7 +171,7 @@ def _expand(
             step_factored(sim, a)
         except Exception:  # noqa: BLE001
             continue
-        _, s = _leaf_score(sim, start_round)
+        _, s = _leaf_score(sim, start_beaten)
         succ.append((s, a, sim))
     return [(a, sim) for _, a, sim in succ]
 
@@ -181,7 +182,7 @@ def plan_blind(gs, constraints: dict | None = None) -> list[FactoredAction]:
     *constraints*: optional {"veto": [hand types], "require": [hand types]}
     steering which hand types the beam may play (falls back to
     unconstrained when nothing legal survives)."""
-    start_round = gs.get("round", 0)
+    start_beaten = blinds_beaten(gs)
     frontier = [_Node(clone(gs))]
     best_leaf: _Node | None = None
     best_alive: _Node | None = None
@@ -189,8 +190,8 @@ def plan_blind(gs, constraints: dict | None = None) -> list[FactoredAction]:
     for _ in range(MAX_DEPTH):
         children: list[_Node] = []
         for node in frontier:
-            for action, sim in _expand(node, start_round, constraints):
-                terminal, score = _leaf_score(sim, start_round)
+            for action, sim in _expand(node, start_beaten, constraints):
+                terminal, score = _leaf_score(sim, start_beaten)
                 child = _Node(sim, node.seq + [action], score)
                 if terminal:
                     if best_leaf is None or score > best_leaf.score:
@@ -250,13 +251,13 @@ def _fast_hand_action(gs) -> FactoredAction | None:
 def _rollout_value(gs) -> float:
     """Cheap rollout: fast play until HORIZON blinds clear; realized progress."""
     sim = clone(gs)
-    r_stop = sim.get("round", 0) + ECON_ROLLOUT_HORIZON
+    stop_beaten = blinds_beaten(sim) + ECON_ROLLOUT_HORIZON
     moves = 0
     with flags_override(peek=False):  # nested peeking explodes rollout cost
         while (
             not is_terminal(sim)
             and not won(sim)
-            and sim.get("round", 0) < r_stop
+            and blinds_beaten(sim) < stop_beaten
             and moves < ECON_ROLLOUT_MOVES
         ):
             phase = sim.get("phase")

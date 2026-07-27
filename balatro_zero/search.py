@@ -33,6 +33,7 @@ from balatro_zero.net import PolicyValueNet, evaluate
 from balatro_zero.state import (
     MAX_ACTIONS,
     Obs,
+    blinds_beaten,
     clone,
     is_terminal,
     legal_factored,
@@ -103,7 +104,7 @@ def _batched_rollouts(
     so ground-truth progress keeps Q discriminating from iteration 0;
     training targets stay pure Monte Carlo).
     """
-    root_round = gs.get("round", 0)
+    root_beaten = blinds_beaten(gs)
     max_steps = (max(depth, 14) if econ_root else depth)
 
     states = []
@@ -128,7 +129,7 @@ def _batched_rollouts(
                     live.discard(i)
                     break
                 if depths[i] >= max_steps or (
-                    econ_root and s.get("round", 0) != root_round
+                    econ_root and blinds_beaten(s) != root_beaten
                 ):
                     live.discard(i)  # leaf — valued after the loop
                     break

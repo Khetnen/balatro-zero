@@ -112,6 +112,23 @@ def ante(gs: dict[str, Any]) -> int:
     return gs.get("round_resets", {}).get("ante", 1)
 
 
+def in_unresolved_blind(gs: dict[str, Any]) -> bool:
+    """True while a selected blind is still undecided (or was lost)."""
+    return gs.get("phase") in (GamePhase.SELECTING_HAND, GamePhase.GAME_OVER)
+
+
+def blinds_beaten(gs: dict[str, Any]) -> int:
+    """Blinds actually defeated so far.
+
+    ``gs["round"]`` counts blinds *started*: the engine bumps it in the
+    select-blind callback (game.py:183, vanilla button_callbacks.lua:2533),
+    not at defeat — so the in-progress or just-lost blind must be backed
+    out.  Skipped blinds are never started and so never counted, matching
+    the pre-fix counter this replaces.
+    """
+    return gs.get("round", 0) - (1 if in_unresolved_blind(gs) else 0)
+
+
 def progress(gs: dict[str, Any]) -> float:
     """Run progress in [0,1]: blinds beaten out of 24, plus fractional chip
     progress toward the current blind. A won run is 1.0.
@@ -123,13 +140,13 @@ def progress(gs: dict[str, Any]) -> float:
     """
     if won(gs):
         return 1.0
-    rounds = gs.get("round", 0)
     frac = 0.0
-    blind = gs.get("blind")
-    target = getattr(blind, "chips", 0) if blind is not None else 0
-    if target > 0:
-        frac = min(gs.get("chips", 0) / target, 0.999)
-    return min((rounds + frac) / 24.0, 1.0)
+    if in_unresolved_blind(gs):
+        blind = gs.get("blind")
+        target = getattr(blind, "chips", 0) if blind is not None else 0
+        if target > 0:
+            frac = min(gs.get("chips", 0) / target, 0.999)
+    return min((blinds_beaten(gs) + frac) / 24.0, 1.0)
 
 
 def obs_vector(gs: dict[str, Any]) -> np.ndarray:
