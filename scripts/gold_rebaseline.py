@@ -16,6 +16,18 @@ References:
     RBASE mean prog 0.467 mean ante 3.91  ante>=4 22/32  wins 0/32
     GOD   mean prog 0.512 mean ante 4.20  ante>=4 18/25  wins 0/25
 
+STALE AS OF 2026-07-28 -- both reference blocks above predate two changes
+that move these numbers BY DESIGN, so do not read a delta against them as
+a regression until the anchor is recomputed:
+  * goldprobe candidate generators widened -- _play_candidates now emits
+    2/3/4-card plays (it only ever emitted 5-card and 1-card, so it could
+    not represent a short hand outscoring the five-card one) and
+    _discard_candidates gained rank- and straight-oriented digs (every
+    candidate used to be defined relative to the most common SUIT).  The
+    probe is strictly less blind, so gold should go UP.
+  * engine bug #73 -- Spectral packs were masked skip-only for every
+    agent, so no gold game has ever picked one.
+
 A collapse here (mean ante ~1.7, runs dying in ante 1) means the probe has
 gone blind to some engine state change, not that the engine got harder --
 that is exactly how the round-counter drift was caught.

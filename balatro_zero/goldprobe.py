@@ -68,6 +68,24 @@ def _leaf_score(gs, start_beaten: int) -> tuple[bool, float]:
     return False, float(gs.get("chips", 0))
 
 
+def _rank_groups(hand) -> list[tuple[int, ...]]:
+    """Hand indices grouped by rank, biggest group first."""
+    groups: dict[int, list[int]] = {}
+    for i, c in enumerate(hand):
+        groups.setdefault(_rank_id(c), []).append(i)
+    return sorted((tuple(g) for g in groups.values()), key=len, reverse=True)
+
+
+def _dedup(combos) -> list[tuple[int, ...]]:
+    seen: set[tuple[int, ...]] = set()
+    out = []
+    for c in combos:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
 def _play_candidates(gs) -> list[FactoredAction]:
     hand = gs.get("hand", [])
     n = len(hand)
@@ -78,11 +96,29 @@ def _play_candidates(gs) -> list[FactoredAction]:
         combos.extend(combinations(range(n), 5))
     else:
         combos.append(tuple(range(n)))
+    # Sub-five plays.  The generator used to emit ONLY 5-card and 1-card
+    # plays, so it could not even represent a short hand that outscores
+    # the five-card version — which is precisely what Half Joker (+20
+    # Mult at <=3 cards) and the hand-type x-mults reward.  Observed: a
+    # 5-card trips for 34,020 offered where the same trips played as 3
+    # cards scored ~109,620.
+    groups = _rank_groups(hand)
+    combos.extend(g for g in groups if 2 <= len(g) <= 4)
+    # Two rank groups together: two pair, and the 4-5 card sets that
+    # short full houses live in.
+    multi = [g for g in groups if len(g) >= 2]
+    for a, b in combinations(multi, 2):
+        merged = tuple(sorted(a + b))
+        if len(merged) <= 5:
+            combos.append(merged)
+    # Generic high-card finishers for flat-scoring boards.
+    by_rank = sorted(range(n), key=lambda i: -_rank_id(hand[i]))
+    combos.extend(tuple(sorted(by_rank[:k])) for k in (2, 3) if n >= k)
     # Small "finisher" plays: cheap ways to close an almost-dead blind.
     combos.extend((i,) for i in range(min(n, 4)))
     return [
         FactoredAction(action_type=int(ActionType.PlayHand), card_target=c)
-        for c in combos
+        for c in _dedup(combos)
     ]
 
 
@@ -105,15 +141,42 @@ def _discard_candidates(gs) -> list[FactoredAction]:
         if 0 < k <= len(off):
             cands.append(tuple(sorted(off[: min(k, 5)])))
     cands.append(tuple(sorted(worst[:2])))
-    seen: set[tuple[int, ...]] = set()
-    out = []
-    for c in cands:
-        if c and c not in seen:
-            seen.add(c)
-            out.append(
-                FactoredAction(action_type=int(ActionType.Discard), card_target=c)
-            )
-    return out
+
+    # Rank-oriented digs.  Every candidate above is defined relative to
+    # the most common SUIT, so the beam could only ever dig toward a
+    # flush; on a pairs/trips board it discarded the wrong cards and
+    # then reported the blind as unwinnable.  Observed: projected DIES
+    # at 5,678/11,000 where one rank-oriented discard reached 40,185.
+    groups = _rank_groups(hand)
+    singles = sorted(
+        (g[0] for g in groups if len(g) == 1), key=lambda i: _rank_id(hand[i])
+    )
+    # Pitch the unpaired cards, keeping the pairs/trips to build on.
+    for k in (5, 3, 2):
+        if len(singles) >= k:
+            cands.append(tuple(sorted(singles[:k])))
+    if singles:
+        cands.append(tuple(sorted(singles[: min(len(singles), 5)])))
+
+    # Straight-oriented: keep the densest five-rank window, pitch outside it.
+    ranks = [_rank_id(c) for c in hand]
+    if ranks:
+        best_lo, best_keep = None, -1
+        for lo in range(min(ranks), max(ranks) + 1):
+            keep = len({r for r in ranks if lo <= r <= lo + 4})
+            if keep > best_keep:
+                best_lo, best_keep = lo, keep
+        if best_lo is not None and best_keep >= 3:
+            outside = [
+                i for i, r in enumerate(ranks) if not best_lo <= r <= best_lo + 4
+            ]
+            if outside:
+                cands.append(tuple(sorted(outside[:5])))
+
+    return [
+        FactoredAction(action_type=int(ActionType.Discard), card_target=c)
+        for c in _dedup(cands)
+    ]
 
 
 def _filter_plays(gs, plays: list[FactoredAction], constraints: dict) -> list[FactoredAction]:
