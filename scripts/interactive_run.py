@@ -26,6 +26,9 @@ At ECON stops --act accepts an option description substring (or index,
 optionally guarded with --expect SUBSTR), exactly as before; "order
 jokers" also works there. A failed or ambiguous --act applies NOTHING
 and reprints the options.
+
+Running with no --act reprints the current stop and changes nothing, so
+it is always safe to look before deciding.
 """
 from __future__ import annotations
 
@@ -75,6 +78,12 @@ RANK_CHAR = {"Ace": "A", "King": "K", "Queen": "Q", "Jack": "J", "10": "T"}
 
 CTL0 = {"auto_round": -1, "veto": [], "require": []}
 
+HAND_FREEFORM_HELP = (
+    "  (free-form: play/discard <cards>, use <cons> [on <cards>], "
+    "copy A onto B, order jokers .., veto/require <hand types>, clear; "
+    "#2 picks duplicate consumables/pack cards)"
+)
+
 
 # ---------------------------------------------------------------------------
 # Card labels & token parsing
@@ -90,6 +99,11 @@ def card_label(c) -> str:
     suit = str(getattr(base.suit, "value", base.suit))
     lbl = RANK_CHAR.get(rank, rank[:1]) + suit[:1].lower()
     tags = []
+    # A boss-debuffed card scores nothing; without this the hand display
+    # was identical under Pillar/The Head and there was no way to see
+    # which dealt cards were dead.
+    if getattr(c, "debuff", False):
+        tags.append("DEBUFFED")
     name = (getattr(c, "ability", None) or {}).get("name", "")
     if name and name != "Default Base":
         tags.append(name.replace(" Card", "").lower())
@@ -164,10 +178,20 @@ def describe(gs, a) -> str:
         items = gs.get("pack_cards", [])
         i = a.entity_target
         extra = ""
+        hl = hand_labels(gs)
         if a.card_target:
-            hl = hand_labels(gs)
             extra = " on " + " ".join(
                 hl[j] if j < len(hl) else str(j) for j in a.card_target)
+        elif i is not None and i < len(items):
+            # A targeting consumable picked WITHOUT targets still fires —
+            # on a default selection the engine chooses.  Show it, so the
+            # pick is never silently aimed for you.
+            from jackdaw.engine.consumables import pack_pick_default_targets
+
+            dt = pack_pick_default_targets(items[i], gs)
+            if dt:
+                aimed = " ".join(hl[j] if j < len(hl) else str(j) for j in dt)
+                extra = f" on {aimed}  <-AUTO-TARGET (override: pick <key> on <cards>)"
         return f"PICK {card_label(items[i]) if i is not None and i < len(items) else '?'}{extra}"
     if t == ActionType.SellJoker:
         return f"SELL {sell_at('jokers', a.entity_target)}"
@@ -309,22 +333,27 @@ def _project_plan(gs, seq) -> str:
     doomed blind is visible at the stop where steering is still possible
     (the beam itself degrades to greedy extraction when no clearing line
     exists and never signals it)."""
-    from balatro_zero.state import clone
+    from balatro_zero.state import blinds_beaten, clone
 
     if not seq:
         return ""
     sim = clone(gs)
-    start_round = sim.get("round", 0)
+    # A cleared blind is only visible as blinds_beaten: gs["round"] counts
+    # blinds STARTED (bumped in the select-blind callback), so it does not
+    # move until the next blind is selected — a winning plan sat in
+    # ROUND_EVAL with the counter unchanged and printed as a bare score
+    # line instead of CLEARS.
+    start_beaten = blinds_beaten(sim)
     for a in seq:
         try:
             step_factored(sim, a)
         except Exception:  # noqa: BLE001
             break
-        if is_terminal(sim) or won(sim) or sim.get("round", 0) > start_round:
+        if is_terminal(sim) or won(sim) or blinds_beaten(sim) > start_beaten:
             break
     blind = gs.get("blind")
     target = getattr(blind, "chips", 0) if blind else 0
-    if won(sim) or sim.get("round", 0) > start_round:
+    if won(sim) or blinds_beaten(sim) > start_beaten:
         hl = sim.get("current_round", {}).get("hands_left", 0)
         return f" [proj: CLEARS, {hl} hands left]"
     if is_terminal(sim):
@@ -681,7 +710,15 @@ def main() -> None:
         gs, moves, ctl = payload if len(payload) == 3 else (*payload, dict(CTL0))
         kind, opts = pickle.loads(Path(str(STATE) + ".opts").read_bytes())
         if args.act is None:
-            print(f"need --act (stop kind: {kind})")
+            # Documented behaviour: reprint the current stop.  Replay the
+            # SAVED stop rather than re-running advance(), which steps the
+            # engine and would move a state the caller only asked to see.
+            print(summary(gs, ctl))
+            print(f"\n[{kind.upper()} stop] options:")
+            for i, o in enumerate(opts):
+                print(f"  [{i}] {o['desc']}")
+            if kind == "hand":
+                print(HAND_FREEFORM_HELP)
             return
         entry = apply_act(gs, ctl, kind, opts, args.act, args.expect)
         if entry:
@@ -703,9 +740,7 @@ def main() -> None:
         for i, o in enumerate(opts):
             print(f"  [{i}] {o['desc']}")
         if kind == "hand":
-            print("  (free-form: play/discard <cards>, use <cons> [on <cards>], "
-                  "copy A onto B, order jokers .., veto/require <hand types>, clear; "
-                  "#2 picks duplicate consumables/pack cards)")
+            print(HAND_FREEFORM_HELP)
     STATE.write_bytes(pickle.dumps((gs, moves, ctl), protocol=5))
     Path(str(STATE) + ".opts").write_bytes(pickle.dumps((kind, opts), protocol=5))
 
