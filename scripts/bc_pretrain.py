@@ -51,13 +51,34 @@ def load(path: Path, drift_ok: bool):
 
 
 def to_tensors(rows, device):
+    """Factored targets: action type, entity slot, and card membership.
+
+    The card-set target is the point of the refactor. The positional
+    head could only learn actions whose exact combo legal_factored
+    happened to sample under CARD_COMBO_BUDGET, which left 7% of pairs
+    with no target at all -- concentrated on play/discard, the decision
+    that matters most. Membership over hand slots expresses every subset.
+    """
+    from balatro_zero.net import N_HAND_SLOTS
+
     o = [r["obs"] for r in rows]
+    card = np.zeros((len(rows), N_HAND_SLOTS), dtype=np.float32)
+    has = np.zeros(len(rows), dtype=bool)
+    for i, r in enumerate(rows):
+        for j in r.get("card_target") or []:
+            if 0 <= int(j) < N_HAND_SLOTS:
+                card[i, int(j)] = 1.0
+                has[i] = True
     return (
         torch.tensor(np.array([x["flat"] for x in o], dtype=np.float32), device=device),
         torch.tensor(np.array([x["joker_ids"] for x in o], dtype=np.int64), device=device),
         torch.tensor(np.array([x["consumable_ids"] for x in o], dtype=np.int64), device=device),
         torch.tensor(np.array([x["market_ids"] for x in o], dtype=np.int64), device=device),
-        torch.tensor(np.array([r["action_idx"] for r in rows], dtype=np.int64), device=device),
+        torch.tensor(np.array([r["action_type"] for r in rows], dtype=np.int64), device=device),
+        torch.tensor(np.array([r["entity_target"] if r["entity_target"] is not None
+                               else -1 for r in rows], dtype=np.int64), device=device),
+        torch.tensor(card, device=device),
+        torch.tensor(has, device=device),
         torch.tensor(np.array([1.0 if r["run_won"] else 0.0 for r in rows],
                               dtype=np.float32), device=device),
         torch.tensor(np.array([r["outcome_progress"] for r in rows],
@@ -80,7 +101,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    from balatro_zero.net import PolicyValueNetV4
+    from balatro_zero.net import PolicyValueNetV5
 
     torch.manual_seed(args.seed)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -99,23 +120,27 @@ def main() -> None:
     tr = [r for r in rows if r["seed"] not in val_seeds]
     va = [r for r in rows if r["seed"] in val_seeds]
 
-    n_pol = sum(1 for r in tr if r["action_idx"] >= 0 and r["model"] in STRONG)
+    n_pol = sum(1 for r in tr if r["model"] in STRONG)
+    n_old = sum(1 for r in tr if r["action_idx"] >= 0 and r["model"] in STRONG)
     print(f"{len(rows)} pairs | train {len(tr)} / val {len(va)} "
           f"(held-out seeds: {sorted(val_seeds)})")
-    print(f"policy-usable train pairs (strong + resolved index): {n_pol}")
+    print(f"policy-usable train pairs: {n_pol} factored, was {n_old} positional "
+          f"(+{n_pol - n_old}: card sets the enumerator never sampled)")
     print(f"device: {dev}")
 
-    net = PolicyValueNetV4().to(dev)
+    net = PolicyValueNetV5().to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
     ce = nn.CrossEntropyLoss()
     bce = nn.BCELoss()
     mse = nn.MSELoss()
+    bce_logits = nn.BCEWithLogitsLoss()
 
     TR = to_tensors(tr, dev)
     VA = to_tensors(va, dev)
 
     def run_epoch(T, train: bool):
-        flat, jid, cid, mid, aidx, wonv, prog, strong = T
+        (flat, jid, cid, mid, atype, aent, acard, ahas,
+         wonv, prog, strong) = T
         n = flat.shape[0]
         order = torch.randperm(n, device=dev) if train else torch.arange(n, device=dev)
         tot = {"pol": 0.0, "win": 0.0, "prog": 0.0, "acc": 0.0, "npol": 0, "n": 0}
@@ -123,14 +148,23 @@ def main() -> None:
         for s in range(0, n, args.batch):
             b = order[s: s + args.batch]
             with torch.set_grad_enabled(train):
-                logits, pw, pg = net(flat[b], jid[b], cid[b], mid[b])
-                # policy: strong demonstrators with a resolved index only
-                m = strong[b] & (aidx[b] >= 0)
+                tl, el, cl, pw, pg = net(flat[b], jid[b], cid[b], mid[b])
+                m = strong[b]      # every strong action is now a target
                 loss_pol = torch.zeros((), device=dev)
                 if m.any():
-                    loss_pol = ce(logits[m], aidx[b][m])
-                    tot["acc"] += (logits[m].argmax(-1) == aidx[b][m]).sum().item()
+                    # action TYPE -- always supervised
+                    loss_pol = ce(tl[m], atype[b][m])
+                    tot["acc"] += (tl[m].argmax(-1) == atype[b][m]).sum().item()
                     tot["npol"] += int(m.sum())
+                    # ENTITY slot -- only where the action names one
+                    me = m & (aent[b] >= 0)
+                    if me.any():
+                        loss_pol = loss_pol + ce(el[me], aent[b][me])
+                    # CARD SET -- the target the positional head could not
+                    # express, so play/discard were largely unsupervised
+                    mc = m & ahas[b]
+                    if mc.any():
+                        loss_pol = loss_pol + bce_logits(cl[mc], acard[b][mc])
                 loss = loss_pol + bce(pw, wonv[b]) + mse(pg, prog[b])
                 if train:
                     opt.zero_grad(set_to_none=True)

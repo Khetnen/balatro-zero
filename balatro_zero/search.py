@@ -30,7 +30,13 @@ import numpy as np
 import torch
 
 from balatro_zero.goldprobe import plan_blind
-from balatro_zero.net import PolicyValueNet, evaluate
+from balatro_zero.net import (
+    PolicyValueNet,
+    action_logit,
+    evaluate,
+    evaluate_factored,
+    is_factored,
+)
 from jackdaw.engine.actions import GamePhase
 
 from balatro_zero.state import (
@@ -82,6 +88,20 @@ def _norm_q(q: np.ndarray, reference: np.ndarray) -> np.ndarray:
     return (q - lo) / (hi - lo)
 
 
+def _apply(sim, action) -> None:
+    """Apply a primitive action or an entire macro plan."""
+    if isinstance(action, MacroPlan):
+        for a in action.seq:
+            if is_terminal(sim):
+                return
+            try:
+                step_factored(sim, a)
+            except Exception:  # noqa: BLE001
+                return
+        return
+    step_factored(sim, action)
+
+
 def _batched_rollouts(
     gs: dict[str, Any],
     actions: list[Any],
@@ -114,7 +134,7 @@ def _batched_rollouts(
     states = []
     for a_idx in sim_specs:
         sim = clone(gs)
-        step_factored(sim, actions[a_idx])
+        _apply(sim, actions[a_idx])
         states.append(sim)
 
     n = len(states)
@@ -178,18 +198,65 @@ def _batched_rollouts(
                 break
         if not need_policy:
             break
-        lg, _ = evaluate(net, [observe(states[i]) for i in need_policy], device)
+        obs_l = [observe(states[i]) for i in need_policy]
+        st_l = [states[i] for i in need_policy]
+        act_l = [pending_acts[i] for i in need_policy]
+        lg_l, _ = _priors(net, obs_l, st_l, act_l, device)
         for row, i in enumerate(need_policy):
             acts = pending_acts.pop(i)
-            step_factored(states[i], acts[int(np.argmax(lg[row, : len(acts)]))])
+            step_factored(states[i], acts[int(np.argmax(lg_l[row]))])
             depths[i] += 1
 
     leaves = [i for i in range(n) if values[i] is None]
     if leaves:
-        _, v = evaluate(net, [observe(states[i]) for i in leaves], device)
+        _, v = _priors(net, [observe(states[i]) for i in leaves],
+                       [states[i] for i in leaves],
+                       [[] for _ in leaves], device)
         for row, i in enumerate(leaves):
             values[i] = float(v[row]) + 0.5 * progress(states[i])
     return values  # type: ignore[return-value]
+
+
+def _priors(net, obs_list, states, action_lists, device):
+    """Prior logits per candidate, for factored or positional nets.
+
+    A factored net scores an action from its CONTENT -- type, entity
+    slot, and card-set membership -- so any action is scorable, including
+    card combinations the enumerator never proposed and whole-blind
+    plans, which have no position in a list of primitives. A positional
+    net can only index the list it was given.
+    """
+    if not is_factored(net):
+        lg, v = evaluate(net, obs_list, device)
+        return [lg[i, : len(action_lists[i])].astype(np.float64)
+                for i in range(len(action_lists))], v
+    tl, el, cl, v = evaluate_factored(net, obs_list, device)
+    out = []
+    for i, acts in enumerate(action_lists):
+        n_hand = len(states[i].get("hand", []))
+        out.append(np.array(
+            [action_logit(tl[i], el[i], cl[i], _head_action(a), n_hand)
+             for a in acts], dtype=np.float64))
+    return out, v
+
+
+def _head_action(a):
+    """A candidate's scorable action: a plan is scored by its opening."""
+    return a.seq[0] if isinstance(a, MacroPlan) else a
+
+
+@dataclass
+class MacroPlan:
+    """A whole-blind line offered to search as a single action.
+
+    Expanding plans instead of individual card plays is what puts the
+    beam's tactical strength into what gets PLAYED rather than only into
+    how candidates are valued -- the rollout-only version measured 1.64
+    against 1.72, i.e. nothing. The net still chooses among lines by
+    value, so hand-level consequences keep flowing into V; the beam
+    proposes, the net disposes.
+    """
+    seq: list
 
 
 def gumbel_search(
@@ -205,16 +272,28 @@ def gumbel_search(
     c_scale: float = 1.0,
     root_noise: bool = True,
     blind_finisher: bool = False,
+    macro_k: int = 0,
 ) -> SearchResult | None:
-    actions = legal_factored(gs)
+    actions: list[Any] = legal_factored(gs)
+    if macro_k > 1 and gs.get("phase") == GamePhase.SELECTING_HAND:
+        plans = [p for p in plan_blind(gs, k=macro_k) if p]
+        # Drop the primitive whose move a plan already opens with:
+        # duplicates score identically, so leaving both in halves the
+        # effective candidate count and lets search take the bare move
+        # when the whole line was the point.
+        heads = {(p[0].action_type, p[0].entity_target, p[0].card_target)
+                 for p in plans}
+        actions = [a for a in actions
+                   if (a.action_type, a.entity_target, a.card_target) not in heads]
+        actions = actions + [MacroPlan(p) for p in plans]
     n = len(actions)
     if n == 0:
         # Reachable dead-end (e.g. hand and deck exhausted mid-blind with
         # hands remaining) — caller treats it as game over.
         return None
     root_obs = observe(gs)
-    logits_all, v_root_arr = evaluate(net, root_obs, device)
-    logits = logits_all[0, :n].astype(np.float64)
+    lg_list, v_root_arr = _priors(net, [root_obs], [gs], [actions], device)
+    logits = lg_list[0]
     # The progress head predicts progress-TO-GO, and child q values include
     # +0.5*realized progress — add the root's realized progress so v_root is
     # on the same absolute scale for the completed-Q backoff/normalization.

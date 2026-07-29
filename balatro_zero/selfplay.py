@@ -31,7 +31,7 @@ import torch
 
 from balatro_zero.net import PolicyValueNet
 from balatro_zero.router import ECON_PHASES, scripted_econ_action
-from balatro_zero.search import gumbel_search
+from balatro_zero.search import _apply, gumbel_search
 from balatro_zero.state import (
     MAX_ACTIONS,
     Obs,
@@ -67,6 +67,8 @@ class SelfPlayConfig:
     blind_finisher: bool = False    # finish blinds with the beam inside
                                     # rollouts instead of policy-greedy
                                     # card play (see search._batched_rollouts)
+    macro_k: int = 0                # offer k whole-blind beam plans as
+                                    # ACTIONS at hand nodes (0 = off)
     max_moves: int = 400
     stake: int = 1
     back_key: str = "b_red"
@@ -150,12 +152,15 @@ def play_game(
                 rng=rng,
                 root_noise=root_noise,
                 blind_finisher=cfg.blind_finisher,
+                macro_k=cfg.macro_k,
             )
             if res is None:  # unplayable dead-end state — treat as game over
                 break
             positions.append((res.root_obs, res.pi_target, progress(gs)))
             action = res.actions[res.action_idx]
-        step_factored(gs, action)
+        # _apply, not step_factored: a chosen macro plan is a whole-blind
+        # line and must be executed in full.
+        _apply(gs, action)
         moves += 1
         a = ante(gs)
         max_ante_seen = max(max_ante_seen, a)
