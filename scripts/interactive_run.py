@@ -14,6 +14,7 @@ agent sees the draw before deciding. At a HAND stop --act accepts:
     play  <cards>            pin an exact play, e.g.  play Kh Qh 7s
     discard <cards>          pin an exact discard
     use <consumable> [on <cards>]   e.g.  use c_sixth_sense on 6d
+    sell <joker|consumable>  sell mid-blind (legal; see engine bug #74)
     copy <card> onto <card>  Death macro: free swaps set direction, then fires
     order jokers <k1, k2..>  free joker reorder macro (also works in shops)
     veto <hand types>        beam must not play these (e.g. veto Flush)
@@ -104,7 +105,8 @@ def _record(ctl, gs, kind: str, entry: str, source: str) -> None:
 
 HAND_FREEFORM_HELP = (
     "  (free-form: play/discard <cards>, use <cons> [on <cards>], "
-    "copy A onto B, order jokers .., veto/require <hand types>, clear; "
+    "sell <joker>, copy A onto B, order jokers .., "
+    "veto/require <hand types>, clear; "
     "#2 picks duplicate consumables/pack cards)"
 )
 
@@ -399,9 +401,20 @@ def _hand_options(gs, ctl) -> list[dict]:
                              + _project_plan(gs, seq)})
     opts.append({"kind": "auto", "action": None,
                  "desc": "AUTO - beam finishes this blind"})
+    # Consumable uses AND sells. Selling mid-blind became legal with
+    # engine bug #74; without listing it here the option would exist in
+    # the engine and in the RL action space but stay invisible to the
+    # agent driving this harness.
+    seen_sell = set()
     for a in legal_factored(gs):
         if a.action_type == ActionType.UseConsumable:
             opts.append({"kind": "action", "action": a, "desc": describe(gs, a)})
+        elif a.action_type in (ActionType.SellJoker, ActionType.SellConsumable):
+            k = (a.action_type, a.entity_target)
+            if k not in seen_sell:
+                seen_sell.add(k)
+                opts.append({"kind": "action", "action": a,
+                             "desc": describe(gs, a)})
     return opts
 
 
@@ -597,6 +610,22 @@ def resolve_hand_act(gs, ctl, opts: list[dict], act: str):
             targets = tuple(sorted(idxs))
         return FactoredAction(action_type=int(ActionType.UseConsumable),
                               entity_target=ci, card_target=targets), False
+    if m := re.match(r"^sell\s+(\S+)$", a, re.I):
+        # Selling mid-blind is legal (engine bug #74: it was gated to the
+        # shop in both mask and executor, but Card:can_sell_card,
+        # card.lua:1640, has no state gate). It is a real tactic --
+        # firing selling_self, dumping a perishable before it decays,
+        # freeing a slot mid-pack -- so the agent needs a way to say it.
+        tok = m.group(1)
+        ji = _find_card(gs.get("jokers", []), tok, "joker")
+        if ji is not None:
+            return FactoredAction(action_type=int(ActionType.SellJoker),
+                                  entity_target=ji), False
+        ci = _find_card(gs.get("consumables", []), tok, "consumable")
+        if ci is not None:
+            return FactoredAction(action_type=int(ActionType.SellConsumable),
+                                  entity_target=ci), False
+        return None, False
     if m := re.match(r"^copy\s+(\S+)\s+onto\s+(\S+)$", a, re.I):
         act_or_none = _death_macro(gs, m.group(1), m.group(2))
         return act_or_none, False
