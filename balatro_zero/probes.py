@@ -59,15 +59,13 @@ def _get_net(ckpt: str):
     if ckpt not in _NET_CACHE:
         import torch
 
-        from balatro_zero.net import PolicyValueNet
+        from balatro_zero.net import load_net
 
         torch.set_num_threads(1)
-        net = PolicyValueNet()
-        net.load_state_dict(
-            torch.load(ckpt, map_location="cpu", weights_only=True)
-        )
-        net.eval()
-        _NET_CACHE[ckpt] = net
+        # load_net sniffs the architecture: the v0-v10 checkpoints are
+        # difficulty-ladder rungs and must keep loading after the joker
+        # attention encoder landed.
+        _NET_CACHE[ckpt] = load_net(ckpt)
     return _NET_CACHE[ckpt]
 
 
