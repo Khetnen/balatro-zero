@@ -60,6 +60,9 @@ SOFT_FIELDS = ("money",)
 # How far ahead to look when re-aligning to their state stream.
 RESYNC_WINDOW = 4
 
+# Action types whose policy target may be matched on entity alone.
+_ENTITY_DECISION = frozenset({14, 11, 15, 16})  # PickPackCard, UseConsumable, SwapJokersL/R
+
 # Engine complaints that mean THEIR tool call was malformed rather than
 # that our state diverged. Anything else (no room, cannot afford, wrong
 # phase) means the trajectories genuinely parted and must stop the run.
@@ -218,6 +221,16 @@ def replay(run: Path, collect_pairs: bool) -> dict:
 
     task = json.loads((run / "task.json").read_text(encoding="utf-8"))
     seed = task["seed"]
+    # Run outcome supplies the VALUE targets. Their final_round counts
+    # blinds played, so blinds beaten is one less; progress() measures
+    # blinds beaten out of 24, and a won run is 1.0 by definition.
+    try:
+        stats = json.loads((run / "stats.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        stats = {}
+    run_won = bool(stats.get("run_won"))
+    final_round = int(stats.get("final_round") or 0)
+    outcome_progress = 1.0 if run_won else max(final_round - 1, 0) / 24.0
     theirs = [json.loads(l) for l in open(run / "gamestates.jsonl", encoding="utf-8")]
     actions = extract_actions(run)
 
@@ -250,10 +263,48 @@ def replay(run: Path, collect_pairs: bool) -> dict:
                 continue
             if collect_pairs:
                 obs = observe(gs)
+                # The policy head is indexed by POSITION in the legal
+                # action list (search.py writes pi_target[action_idx]),
+                # so BC needs their action's index in that same list.
+                # It can be absent: card_target combos are subsampled
+                # under CARD_COMBO_BUDGET, so an exact 5-card play may
+                # not be enumerated. -1 marks those; they still carry a
+                # usable value target even without a policy target.
+                legal = legal_factored(gs)
+                want = acts[0]
+                idx = -1
+                for n, cand in enumerate(legal):
+                    if (cand.action_type == want.action_type
+                            and cand.entity_target == want.entity_target
+                            and cand.card_target == want.card_target):
+                        idx = n
+                        break
+                if idx < 0 and want.action_type in _ENTITY_DECISION:
+                    # For these the ENTITY is the decision and the card
+                    # targets are a sub-choice legal_factored does not
+                    # enumerate (PickPackCard is entity-only; consumable
+                    # targets are subsampled). Matching on the entity
+                    # recovers a correct policy target. NOT done for
+                    # play/discard, where the card set IS the decision --
+                    # a loose match there would teach the wrong label,
+                    # and the per-card head is the real fix.
+                    for n, cand in enumerate(legal):
+                        if (cand.action_type == want.action_type
+                                and cand.entity_target == want.entity_target):
+                            idx = n
+                            break
                 pairs.append({
                     "seed": seed, "model": task["model"]["name"], "step": i,
                     "verb": verb, "args": {k: v for k, v in args.items()
                                            if k != "reasoning"},
+                    "action_type": want.action_type,
+                    "entity_target": want.entity_target,
+                    "card_target": list(want.card_target or ()),
+                    "action_idx": idx,
+                    "n_legal": len(legal),
+                    "run_won": run_won,
+                    "outcome_progress": outcome_progress,
+                    "after_money_drift": result["money_drift_at"] is not None,
                     "obs": {
                         "flat": obs.flat.tolist(),
                         "joker_ids": obs.joker_ids.tolist(),
