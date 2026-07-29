@@ -47,6 +47,8 @@ N_PLAY_KEEP = 6
 WON_RUN = 1e9
 CLEARED = 1e6
 DEAD = -1e6
+# Alive leaves live in [0, ALIVE_BAND) so they can never outrank CLEARED.
+ALIVE_BAND = 1e5
 
 
 @dataclass
@@ -56,16 +58,55 @@ class _Node:
     score: float = 0.0
 
 
-def _leaf_score(gs, start_beaten: int) -> tuple[bool, float]:
-    """(is_terminal_for_blind, score). Higher = better."""
+def _head(node) -> tuple | None:
+    """Identity of a plan's opening move, for diversity grouping."""
+    if not node.seq:
+        return None
+    a = node.seq[0]
+    return (a.action_type, a.entity_target, a.card_target)
+
+
+def _blind_frac(gs) -> float:
+    """Chips scored as a fraction of this blind's target."""
+    blind = gs.get("blind")
+    target = (getattr(blind, "chips", 0) if blind is not None else 0) or 1
+    return float(gs.get("chips", 0)) / float(target)
+
+
+def _leaf_score(gs, start_beaten: int, value_fn=None, blend: float = 0.0):
+    """(is_terminal_for_blind, score). Higher = better.
+
+    Alive leaves are scored as a FRACTION of the blind target scaled into
+    a band below CLEARED, not as raw chips. Raw chips was a real ordering
+    bug: CLEARED is 1e6 and an ante-8 board routinely scores several
+    million, so a still-alive leaf outranked one that had actually won
+    the blind -- the beam preferred to keep scoring over to win, in
+    exactly the late antes that decide runs. The fraction is monotone in
+    chips within a blind, so ordering is otherwise unchanged.
+
+    *value_fn* maps a state to [0,1]; *blend* mixes it against the chip
+    fraction. This is what lets intra-blind play serve the whole run:
+    with a learned V, a line that ends the blind holding kings for Baron,
+    or that avoids levelling the hand Obelisk wants unplayed, outranks a
+    line that merely scores more -- because V learned it, not because
+    anyone coded the interaction. blend=0 reproduces the old objective
+    exactly, which is what the anneal starts from while V is still noise.
+    """
     if won(gs):
         return True, WON_RUN
     if is_terminal(gs):
         return True, DEAD + gs.get("chips", 0)
     if blinds_beaten(gs) > start_beaten:  # blind defeated (pre-cash-out)
         cr = gs.get("current_round", {})
-        return True, CLEARED + cr.get("hands_left", 0) * 1e3 + gs.get("dollars", 0)
-    return False, float(gs.get("chips", 0))
+        score = CLEARED + cr.get("hands_left", 0) * 1e3 + gs.get("dollars", 0)
+        if value_fn is not None and blend > 0.0:
+            # Rank CLEARING lines by the position they leave behind.
+            score += blend * value_fn(gs) * 1e4
+        return True, score
+    frac = _blind_frac(gs)
+    if value_fn is not None and blend > 0.0:
+        frac = (1.0 - blend) * frac + blend * value_fn(gs)
+    return False, frac * ALIVE_BAND
 
 
 def _rank_groups(hand) -> list[tuple[int, ...]]:
@@ -205,7 +246,8 @@ def _filter_plays(gs, plays: list[FactoredAction], constraints: dict) -> list[Fa
 
 
 def _expand(
-    node: _Node, start_beaten: int, constraints: dict | None = None
+    node: _Node, start_beaten: int, constraints: dict | None = None,
+    value_fn=None, blend: float = 0.0,
 ) -> list[tuple[FactoredAction, dict]]:
     gs = node.gs
     succ: list[tuple[float, FactoredAction, dict]] = []
@@ -220,7 +262,7 @@ def _expand(
             step_factored(sim, a)
         except Exception:  # noqa: BLE001
             continue
-        _, s = _leaf_score(sim, start_beaten)
+        _, s = _leaf_score(sim, start_beaten, value_fn, blend)
         plays.append((s, a, sim))
     plays.sort(key=lambda t: -t[0])
     succ.extend(plays[:N_PLAY_KEEP])
@@ -234,44 +276,98 @@ def _expand(
             step_factored(sim, a)
         except Exception:  # noqa: BLE001
             continue
-        _, s = _leaf_score(sim, start_beaten)
+        _, s = _leaf_score(sim, start_beaten, value_fn, blend)
         succ.append((s, a, sim))
     return [(a, sim) for _, a, sim in succ]
 
 
-def plan_blind(gs, constraints: dict | None = None) -> list[FactoredAction]:
-    """Beam-search the current blind; return the best action sequence.
+def plan_blind(gs, constraints: dict | None = None, value_fn=None,
+               blend: float = 0.0, k: int = 1):
+    """Beam-search the current blind.
+
+    Returns the best action sequence, or -- when *k* > 1 -- a list of up
+    to k plans with DISTINCT first actions, for use as macro-actions.
+    Expanding whole-blind plans instead of individual card plays is what
+    collapses the search depth: one macro decision per blind rather than
+    ~8 card decisions, which is what makes the 200-move credit-assignment
+    horizon tractable.
 
     *constraints*: optional {"veto": [hand types], "require": [hand types]}
     steering which hand types the beam may play (falls back to
-    unconstrained when nothing legal survives)."""
+    unconstrained when nothing legal survives).
+    *value_fn* / *blend*: see _leaf_score -- the learned objective.
+    """
     start_beaten = blinds_beaten(gs)
     frontier = [_Node(clone(gs))]
+    leaves: list[_Node] = []
     best_leaf: _Node | None = None
     best_alive: _Node | None = None
 
     for _ in range(MAX_DEPTH):
         children: list[_Node] = []
         for node in frontier:
-            for action, sim in _expand(node, start_beaten, constraints):
-                terminal, score = _leaf_score(sim, start_beaten)
+            for action, sim in _expand(node, start_beaten, constraints,
+                                       value_fn, blend):
+                terminal, score = _leaf_score(sim, start_beaten, value_fn, blend)
                 child = _Node(sim, node.seq + [action], score)
                 if terminal:
+                    leaves.append(child)
                     if best_leaf is None or score > best_leaf.score:
                         best_leaf = child
                 else:
                     children.append(child)
                     if best_alive is None or score > best_alive.score:
                         best_alive = child
-        if best_leaf is not None and best_leaf.score >= CLEARED:
+        if best_leaf is not None and best_leaf.score >= CLEARED and k <= 1:
             break  # a clearing line exists; deeper search only refines it
         children.sort(key=lambda n: -n.score)
-        frontier = children[:BEAM_WIDTH]
+        if k > 1:
+            # Stratify the frontier by OPENING move. A plain top-N beam
+            # collapses onto one opening within two plies -- every
+            # survivor is a refinement of the same first play -- so the
+            # leaves it reaches all share a head and there is nothing to
+            # offer search as alternative macro-actions. Keeping the best
+            # survivor per distinct opening preserves the branching that
+            # makes the plans genuinely different lines.
+            by_head: dict = {}
+            for n in children:
+                h = _head(n)
+                if h is not None and (h not in by_head
+                                      or n.score > by_head[h].score):
+                    by_head[h] = n
+            keep = sorted(by_head.values(), key=lambda n: -n.score)
+            width = max(BEAM_WIDTH, k)
+            frontier = keep[:width]
+            if len(frontier) < width:
+                have = {id(n) for n in frontier}
+                frontier += [n for n in children if id(n) not in have][
+                    : width - len(frontier)]
+        else:
+            frontier = children[:BEAM_WIDTH]
         if not frontier:
             break
 
-    pick = best_leaf or best_alive
-    return pick.seq if pick else []
+    if k <= 1:
+        pick = best_leaf or best_alive
+        return pick.seq if pick else []
+
+
+    # Diverse top-k: one plan per distinct opening move, so the macro
+    # actions offered to search are genuinely different lines rather
+    # than k refinements of the same one.
+    pool = sorted(leaves + ([best_alive] if best_alive else []),
+                  key=lambda n: -n.score)
+    out: list[list[FactoredAction]] = []
+    seen: set = set()
+    for n in pool:
+        head = _head(n)
+        if head is None or head in seen:
+            continue
+        seen.add(head)
+        out.append(n.seq)
+        if len(out) >= k:
+            break
+    return out
 
 
 ECON_ROLLOUT_HORIZON = 3   # blinds to simulate when valuing an econ action

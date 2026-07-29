@@ -64,6 +64,9 @@ class SelfPlayConfig:
     sims: int = 16
     k_max: int = 8
     depth: int = 2
+    blind_finisher: bool = False    # finish blinds with the beam inside
+                                    # rollouts instead of policy-greedy
+                                    # card play (see search._batched_rollouts)
     max_moves: int = 400
     stake: int = 1
     back_key: str = "b_red"
@@ -146,6 +149,7 @@ def play_game(
                 depth=cfg.depth,
                 rng=rng,
                 root_noise=root_noise,
+                blind_finisher=cfg.blind_finisher,
             )
             if res is None:  # unplayable dead-end state — treat as game over
                 break

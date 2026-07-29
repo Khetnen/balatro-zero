@@ -72,6 +72,8 @@ def main() -> None:
     ap.add_argument("--eps", type=float, default=0.15)
     ap.add_argument("--sims", type=int, default=32)
     ap.add_argument("--depth", type=int, default=1)
+    ap.add_argument("--finisher", action="store_true",
+                    help="finish blinds with the beam inside rollouts")
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -82,8 +84,11 @@ def main() -> None:
     if args.probe == "net":
         if not args.ckpt:
             raise SystemExit("--probe net requires --ckpt")
-        params.update(ckpt=args.ckpt, sims=args.sims, depth=args.depth)
+        params.update(ckpt=args.ckpt, sims=args.sims, depth=args.depth,
+                      blind_finisher=args.finisher)
     label = args.probe if not args.ckpt else f"{args.probe}:{Path(args.ckpt).stem}"
+    if args.finisher:
+        label += "+beam"
     spec = ProbeSpec(name=label, kind=args.probe, params=params)
 
     jobs = [(spec, s, r) for s in SEEDS for r in range(args.runs)]

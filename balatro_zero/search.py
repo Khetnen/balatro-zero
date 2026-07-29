@@ -29,7 +29,10 @@ from typing import Any
 import numpy as np
 import torch
 
+from balatro_zero.goldprobe import plan_blind
 from balatro_zero.net import PolicyValueNet, evaluate
+from jackdaw.engine.actions import GamePhase
+
 from balatro_zero.state import (
     MAX_ACTIONS,
     Obs,
@@ -88,6 +91,7 @@ def _batched_rollouts(
     *,
     econ_root: bool,
     depth: int,
+    blind_finisher: bool = False,
 ) -> list[float]:
     """Run one simulation per entry of sim_specs, batching net evaluations.
 
@@ -133,6 +137,34 @@ def _batched_rollouts(
                 ):
                     live.discard(i)  # leaf — valued after the loop
                     break
+                if blind_finisher and s.get("phase") == GamePhase.SELECTING_HAND:
+                    # Finish the blind with the BEAM rather than walking
+                    # it one policy-greedy card at a time. A rollout
+                    # exists to say what a candidate is worth, and an
+                    # undertrained policy playing cards singly answers
+                    # that badly: on the bench-five seeds the gold beam
+                    # reaches mean ante 3.12 where the same net under a
+                    # depth-1 policy rollout reaches 1.72, and the whole
+                    # gap is tactical play. One plan counts as one depth
+                    # step, which also collapses the ~8-decisions-per-
+                    # blind horizon that makes credit assignment hard.
+                    #
+                    # blend=0: the beam runs on the engine alone. A
+                    # net-valued beam would cost ~65 candidates x 12
+                    # plies of forward passes per blind per simulation.
+                    # V is applied once, at the leaf, where it is
+                    # affordable.
+                    plan = plan_blind(s, blend=0.0)
+                    if plan:
+                        for a in plan:
+                            if is_terminal(s):
+                                break
+                            try:
+                                step_factored(s, a)
+                            except Exception:  # noqa: BLE001
+                                break
+                        depths[i] += 1
+                        continue
                 acts = legal_factored(s)
                 if not acts:
                     live.discard(i)  # dead-end — valued as leaf
@@ -172,6 +204,7 @@ def gumbel_search(
     c_visit: float = 50.0,
     c_scale: float = 1.0,
     root_noise: bool = True,
+    blind_finisher: bool = False,
 ) -> SearchResult | None:
     actions = legal_factored(gs)
     n = len(actions)

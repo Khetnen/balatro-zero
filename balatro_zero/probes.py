@@ -119,13 +119,15 @@ def _scripted_game(seed: str, rng: np.random.Generator, eps: float,
 
 
 def _net_game(seed: str, rng: np.random.Generator, ckpt: str,
-              sims: int, depth: int) -> dict[str, Any]:
+              sims: int, depth: int,
+              blind_finisher: bool = False) -> dict[str, Any]:
     import torch
 
     from balatro_zero.selfplay import SelfPlayConfig, play_game
 
     net = _get_net(ckpt)
-    cfg = SelfPlayConfig(sims=sims, k_max=min(8, max(2, sims)), depth=depth)
+    cfg = SelfPlayConfig(sims=sims, k_max=min(8, max(2, sims)), depth=depth,
+                         blind_finisher=blind_finisher)
     _, st, _ = play_game(
         net, torch.device("cpu"), seed, cfg, rng, root_noise=True
     )
@@ -145,6 +147,7 @@ def run_probe_game(spec: ProbeSpec, seed: str, rollout: int) -> dict[str, Any]:
         out = _net_game(
             seed, rng, spec.params["ckpt"],
             int(spec.params.get("sims", 32)), int(spec.params.get("depth", 1)),
+            bool(spec.params.get("blind_finisher", False)),
         )
     elif spec.kind == "gold":
         from balatro_zero.goldprobe import gold_game
