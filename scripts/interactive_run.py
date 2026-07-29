@@ -77,9 +77,13 @@ HAND_TYPES = {h.lower(): h for h in [
 
 RANK_CHAR = {"Ace": "A", "King": "K", "Queen": "Q", "Jack": "J", "10": "T"}
 
-CTL0 = {"auto_round": -1, "veto": [], "require": []}
+CTL0 = {"auto_round": -1, "veto": [], "require": [],
+        # unaided: hide the beam entirely at hand stops (harvest mode).
+        # capture_pairs: also record the observation with each decision,
+        # so a run doubles as behaviour-cloning data in native format.
+        "unaided": False, "capture_pairs": False}
 
-def _record(ctl, gs, kind: str, entry: str, source: str) -> None:
+def _record(ctl, gs, kind: str, entry: str, source: str, action=None) -> None:
     """Append a decision to ctl['log'] with its provenance.
 
     `source` is the whole point: 'beam-pass'/'beam-auto' mean the agent
@@ -91,7 +95,7 @@ def _record(ctl, gs, kind: str, entry: str, source: str) -> None:
     Lives in ctl (a dict) rather than the pickle tuple so old state
     files keep loading.
     """
-    ctl.setdefault("log", []).append({
+    rec = {
         "stop": kind,
         "source": source,
         "entry": entry,
@@ -100,7 +104,26 @@ def _record(ctl, gs, kind: str, entry: str, source: str) -> None:
         "phase": getattr(gs.get("phase"), "value", str(gs.get("phase"))),
         "dollars": gs.get("dollars", 0),
         "chips": gs.get("chips", 0),
-    })
+    }
+    if action is not None:
+        rec["action_type"] = int(action.action_type)
+        rec["entity_target"] = action.entity_target
+        rec["card_target"] = list(action.card_target or ())
+    if ctl.get("capture_pairs"):
+        # Snapshot the observation BEFORE the action, in the same shape
+        # bb_replay emits, so a harvested game feeds bc_pretrain unchanged
+        # -- and natively, with none of the replay desync that cost 35% of
+        # the BalatroBench pairs.
+        from balatro_zero.state import observe
+
+        o = observe(gs)
+        rec["obs"] = {
+            "flat": o.flat.tolist(),
+            "joker_ids": o.joker_ids.tolist(),
+            "consumable_ids": o.consumable_ids.tolist(),
+            "market_ids": o.market_ids.tolist(),
+        }
+    ctl.setdefault("log", []).append(rec)
 
 
 HAND_FREEFORM_HELP = (
@@ -389,18 +412,29 @@ def _project_plan(gs, seq) -> str:
 
 
 def _hand_options(gs, ctl) -> list[dict]:
-    seq = plan_blind(gs, _constraints(ctl))
-    first = seq[0] if seq else None
-    if first is None:
-        legal = legal_factored(gs)
-        first = legal[0] if legal else None
     opts = []
-    if first is not None:
-        opts.append({"kind": "pass", "action": first,
-                     "desc": f"PASS - beam: {describe(gs, first)}"
-                             + _project_plan(gs, seq)})
-    opts.append({"kind": "auto", "action": None,
-                 "desc": "AUTO - beam finishes this blind"})
+    if ctl.get("unaided"):
+        # UNAIDED: the beam is not consulted and its suggestion is not
+        # shown. Demonstrations harvested with PASS/AUTO available are
+        # demonstrations of a BEAM-ASSISTED policy -- cloning them
+        # teaches deferring to an assistant the trained agent will not
+        # have, and the projection hint alone would anchor the choice.
+        # The agent must name the cards itself, which is the whole
+        # ability we are trying to collect.
+        opts.append({"kind": "freeform", "action": None,
+                     "desc": "(unaided: issue play/discard/use/sell yourself)"})
+    else:
+        seq = plan_blind(gs, _constraints(ctl))
+        first = seq[0] if seq else None
+        if first is None:
+            legal = legal_factored(gs)
+            first = legal[0] if legal else None
+        if first is not None:
+            opts.append({"kind": "pass", "action": first,
+                         "desc": f"PASS - beam: {describe(gs, first)}"
+                                 + _project_plan(gs, seq)})
+        opts.append({"kind": "auto", "action": None,
+                     "desc": "AUTO - beam finishes this blind"})
     # Consumable uses AND sells. Selling mid-blind became legal with
     # engine bug #74; without listing it here the option would exist in
     # the engine and in the RL action space but stay invisible to the
@@ -712,7 +746,7 @@ def apply_act(gs, ctl, kind: str, opts: list[dict], act: str,
             # already have -- behaviour-cloning the rest clones the beam.
             beam = opts[0]["action"] if opts and opts[0]["kind"] == "pass" else None
             src = "beam-pass" if beam is not None and resolved == beam else "override"
-            _record(ctl, gs, kind, entry, src)
+            _record(ctl, gs, kind, entry, src, resolved)
             step_factored(gs, resolved)
             return entry
         except Exception as e:  # noqa: BLE001
@@ -738,19 +772,20 @@ def apply_act(gs, ctl, kind: str, opts: list[dict], act: str,
                            card_target=tuple(sorted(idxs)))
         try:
             entry = describe(gs, a)
-            _record(ctl, gs, kind, entry, "econ")
+            _record(ctl, gs, kind, entry, "econ", a)
             step_factored(gs, a)
             return entry
         except Exception as e:  # noqa: BLE001
             print(f"ILLEGAL ({e}); state unchanged")
             return None
-    i = resolve_act([o["desc"] for o in opts], act, expect)
+    i = resolve_act([o["desc"] for o in opts if o["kind"] != "freeform"],
+                    act, expect)
     if i is None:
         return None
     a = opts[i]["action"]
     try:
         entry = describe(gs, a)
-        _record(ctl, gs, kind, entry, "econ")
+        _record(ctl, gs, kind, entry, "econ", a)
         step_factored(gs, a)
         return entry
     except Exception as e:  # noqa: BLE001
