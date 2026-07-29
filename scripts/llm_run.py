@@ -20,15 +20,35 @@ desync -- the BalatroBench pipeline lost 35% of its actions to that and
 was confined to five seeds. Here any seed is fair game, and seed
 diversity is the binding constraint on what BC can learn.
 
+Defaults target OpenRouter, which is what BalatroBench itself ran on --
+their stored responses carry OpenRouter generation IDs (`gen-...`), the
+`vendor/model` id form, and a `provider` routing field. One key reaches
+every vendor, and the endpoint is OpenAI-compatible, so this driver
+needs no vendor-specific client. Set OPENROUTER_API_KEY.
+
+PIN THE PROVIDER for a harvest. OpenRouter routes the same model id to
+different upstreams; across BalatroBench's runs one model was served by
+Amazon Bedrock, Google, SiliconFlow, AtlasCloud and DeepInfra in turn.
+Upstreams differ in quantisation and sampling defaults, so some of the
+variance in their leaderboard is provider variance, not model variance.
+--provider pins it; the provider that served each decision is recorded
+either way.
+
 Usage (from balatro-zero/):
-    uv run --no-sync python scripts/llm_run.py SEED [--model qwen2.5:7b]
-        [--url http://127.0.0.1:11434/v1/chat/completions] [--temp 0.3]
-        [--unaided] [--pairs runs/llm_pairs.jsonl]
+    export OPENROUTER_API_KEY=sk-or-...
+    uv run --no-sync python scripts/llm_run.py SEED --unaided
+        --model anthropic/claude-sonnet-5 --provider Anthropic
+        --pairs runs/llm_pairs.jsonl
+
+    # local Ollama instead (no key):
+    uv run --no-sync python scripts/llm_run.py SEED --key-env ""
+        --url http://127.0.0.1:11434/v1/chat/completions --model qwen2.5:7b
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.request
 
@@ -116,21 +136,43 @@ max 8 words of reasoning."""
 
 def ask_llm(url: str, model: str, temp: float, state_txt: str,
             options: list[str], recent: list[str], kind: str,
-            system: str = SYSTEM) -> str:
+            system: str = SYSTEM, api_key: str | None = None,
+            provider: str | None = None) -> tuple[str, dict]:
+    """Returns (reply_text, meta) where meta carries provider/model/usage.
+
+    The provider matters. OpenRouter routes the same model ID to
+    different upstreams, and BalatroBench's own runs show that in the
+    data -- one model served variously by Amazon Bedrock, Google,
+    SiliconFlow, AtlasCloud and DeepInfra. Upstreams differ in
+    quantisation and sampling defaults, so part of the variance in
+    their leaderboard is provider variance rather than model variance.
+    Pin *provider* for a reproducible harvest, and record what actually
+    served each decision either way.
+    """
     ctx = ("Recent decisions: " + "; ".join(recent[-6:]) + "\n\n") if recent else ""
     user = (f"{ctx}{state_txt}\n\n[{kind.upper()} stop] options:\n"
             + "\n".join(f"  [{i}] {o}" for i, o in enumerate(options))
             + "\n\nYour command?")
-    body = json.dumps({
+    payload: dict = {
         "model": model, "temperature": temp,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
-    }).encode()
-    req = urllib.request.Request(url, data=body,
-                                 headers={"Content-Type": "application/json"})
+    }
+    if provider:
+        # OpenRouter routing control: one upstream, no silent failover.
+        payload["provider"] = {"order": [provider], "allow_fallbacks": False}
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        # OpenRouter attribution headers; harmless elsewhere.
+        headers["X-Title"] = "balatro-zero harvest"
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                 headers=headers)
     with urllib.request.urlopen(req, timeout=300) as r:
         out = json.loads(r.read())
-    return out["choices"][0]["message"]["content"].strip()
+    meta = {"provider": out.get("provider"), "served_model": out.get("model"),
+            "usage": out.get("usage")}
+    return out["choices"][0]["message"]["content"].strip(), meta
 
 
 def _rescue(gs, ctl, kind: str) -> str:
@@ -179,6 +221,8 @@ def write_pairs(path: str, ctl, seed: str, model: str, gs) -> int:
                 "run_won": won_run,
                 "outcome_progress": prog,
                 "after_money_drift": False,
+                "provider": r.get("provider"),
+                "served_model": r.get("served_model"),
                 "obs": r["obs"],
             }) + "\n")
             kept += 1
@@ -188,8 +232,16 @@ def write_pairs(path: str, ctl, seed: str, model: str, gs) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("seed")
-    ap.add_argument("--model", default="qwen2.5:7b")
-    ap.add_argument("--url", default="http://127.0.0.1:11434/v1/chat/completions")
+    ap.add_argument("--model", default="anthropic/claude-sonnet-5",
+                    help="OpenRouter vendor/model id, e.g. "
+                         "anthropic/claude-opus-5, google/gemini-3-pro-preview")
+    ap.add_argument("--url",
+                    default="https://openrouter.ai/api/v1/chat/completions")
+    ap.add_argument("--key-env", default="OPENROUTER_API_KEY",
+                    help="env var holding the API key (blank for local Ollama)")
+    ap.add_argument("--provider", default=None,
+                    help="pin the OpenRouter upstream (e.g. Anthropic, Google) "
+                         "so a harvest is not split across upstreams")
     ap.add_argument("--temp", type=float, default=0.3)
     ap.add_argument("--max-decisions", type=int, default=400)
     ap.add_argument("--unaided", action="store_true",
@@ -198,6 +250,13 @@ def main() -> None:
                     help="append (obs, action) cloning pairs to this jsonl")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
+
+    api_key = os.environ.get(args.key_env) if args.key_env else None
+    if args.key_env and not api_key and "openrouter" in args.url:
+        raise SystemExit(
+            f"{args.key_env} is not set. Get a key from openrouter.ai and "
+            f"export it, or pass --key-env '' for a local endpoint."
+        )
 
     gs = new_run(args.seed)
     ctl = dict(CTL0)
@@ -214,10 +273,12 @@ def main() -> None:
         state_txt = summary(gs, ctl)
         descs = [o["desc"] for o in opts]
         applied = None
+        meta: dict = {}
         for attempt in range(2):
             try:
-                reply = ask_llm(args.url, args.model, args.temp, state_txt,
-                                descs, recent, kind, system)
+                reply, meta = ask_llm(args.url, args.model, args.temp,
+                                      state_txt, descs, recent, kind, system,
+                                      api_key, args.provider)
             except Exception as e:  # noqa: BLE001
                 print(f"LLM error: {e}", flush=True)
                 reply = None
@@ -241,6 +302,11 @@ def main() -> None:
                 break
             if ctl.get("log"):
                 ctl["log"][-1]["source"] = "fallback"
+        if applied and ctl.get("log") and meta.get("provider"):
+            # Stamp what actually served this decision -- OpenRouter can
+            # route the same model to a different upstream mid-run.
+            ctl["log"][-1].setdefault("provider", meta["provider"])
+            ctl["log"][-1].setdefault("served_model", meta.get("served_model"))
         if applied:
             recent.append(applied)
         n += 1
