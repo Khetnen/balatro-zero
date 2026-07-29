@@ -78,6 +78,30 @@ RANK_CHAR = {"Ace": "A", "King": "K", "Queen": "Q", "Jack": "J", "10": "T"}
 
 CTL0 = {"auto_round": -1, "veto": [], "require": []}
 
+def _record(ctl, gs, kind: str, entry: str, source: str) -> None:
+    """Append a decision to ctl['log'] with its provenance.
+
+    `source` is the whole point: 'beam-pass'/'beam-auto' mean the agent
+    deferred to the beam, so the decision is the BEAM's and cloning it
+    teaches a policy nothing the beam does not already do. 'override'
+    and 'econ' are the agent's own. Harvesting for behaviour cloning
+    must filter on this or it trains on the wrong demonstrator.
+
+    Lives in ctl (a dict) rather than the pickle tuple so old state
+    files keep loading.
+    """
+    ctl.setdefault("log", []).append({
+        "stop": kind,
+        "source": source,
+        "entry": entry,
+        "ante": ante(gs),
+        "round": gs.get("round", 0),
+        "phase": getattr(gs.get("phase"), "value", str(gs.get("phase"))),
+        "dollars": gs.get("dollars", 0),
+        "chips": gs.get("chips", 0),
+    })
+
+
 HAND_FREEFORM_HELP = (
     "  (free-form: play/discard <cards>, use <cons> [on <cards>], "
     "copy A onto B, order jokers .., veto/require <hand types>, clear; "
@@ -644,20 +668,34 @@ def apply_act(gs, ctl, kind: str, opts: list[dict], act: str,
         if resolved is None:
             return None
         if resolved == "auto":
+            _record(ctl, gs, kind, "AUTO", "beam-auto")
             ctl["auto_round"] = gs.get("round", 0)
             return "AUTO"
         if isinstance(resolved, tuple) and resolved[0] == "order":
-            return "ORDER" if _order_jokers(gs, resolved[1]) else None
+            ok = _order_jokers(gs, resolved[1])
+            if ok:
+                _record(ctl, gs, kind, "ORDER", "override")
+            return "ORDER" if ok else None
         try:
             entry = describe(gs, resolved)
+            # Did the agent take the beam's suggestion or overrule it?
+            # Only the overrules carry information the beam did not
+            # already have -- behaviour-cloning the rest clones the beam.
+            beam = opts[0]["action"] if opts and opts[0]["kind"] == "pass" else None
+            src = "beam-pass" if beam is not None and resolved == beam else "override"
+            _record(ctl, gs, kind, entry, src)
             step_factored(gs, resolved)
             return entry
         except Exception as e:  # noqa: BLE001
             print(f"ILLEGAL ({e}); state unchanged")
             return None
-    # econ stop
+    # econ stop -- every choice here is the agent's own; the beam makes
+    # no economy suggestions, so all of these are informative labels.
     if m := re.match(r"^order\s+jokers?\s+(.+)$", act.strip(), re.I):
-        return "ORDER" if _order_jokers(gs, m.group(1)) else None
+        ok = _order_jokers(gs, m.group(1))
+        if ok:
+            _record(ctl, gs, kind, "ORDER", "econ")
+        return "ORDER" if ok else None
     if m := re.match(r"^pick\s+(\S+)\s+on\s+(.+)$", act.strip(), re.I):
         # Targeted pack pick: a card-targeting tarot fired at dealt cards.
         hit = _find_card(gs.get("pack_cards", []), m.group(1), "pack card")
@@ -671,6 +709,7 @@ def apply_act(gs, ctl, kind: str, opts: list[dict], act: str,
                            card_target=tuple(sorted(idxs)))
         try:
             entry = describe(gs, a)
+            _record(ctl, gs, kind, entry, "econ")
             step_factored(gs, a)
             return entry
         except Exception as e:  # noqa: BLE001
@@ -682,6 +721,7 @@ def apply_act(gs, ctl, kind: str, opts: list[dict], act: str,
     a = opts[i]["action"]
     try:
         entry = describe(gs, a)
+        _record(ctl, gs, kind, entry, "econ")
         step_factored(gs, a)
         return entry
     except Exception as e:  # noqa: BLE001
