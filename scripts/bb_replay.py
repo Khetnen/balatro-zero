@@ -33,29 +33,38 @@ from __future__ import annotations
 
 import argparse
 import json
-import pickle
+import re
+import sys
 from pathlib import Path
 
 ROOT = Path("runs/balatrobench/runs/runs/v1.0.8/default")
 
 # Money is a SOFT divergence: it does not stop the replay.
 #
-# balatrobot is known to under-collect at cash-out -- our own lockstep
-# work catalogued the eval-stall signature as "live under-collects by
-# exactly one blind reward ($3/$4/$5)" plus a cash_out race that pays
-# current_round.dollars before the bottom eval row commits. Every money
-# divergence seen here has our side HIGHER, which is that artifact's
-# direction, and content (jokers, consumables, hand levels) stays in
-# agreement across it.
+# balatrobot is known to mis-collect at cash-out -- our own lockstep work
+# catalogued live under-collecting by exactly one blind reward at
+# hands-exhausted cash-outs, plus a cash_out race. Content (jokers,
+# consumables, hand levels) stays in agreement across these, so treating
+# money as fatal would throw away most of the dataset for a field the
+# live oracle is known to get wrong.
 #
-# Continuing is safe precisely BECAUSE we are richer: we replay their
-# choices rather than making our own, so their purchases remain
-# affordable for us. Content divergence still hard-stops -- that would
-# mean the trajectories genuinely parted.
+# NOT a free pass, and an earlier version of this comment was wrong to
+# claim we are always richer: over the full 241 runs the drift is
+# BIDIRECTIONAL (61 ours-higher, 13 ours-lower), and the ours-lower
+# cases are precisely why 17 runs then die on "Cannot afford". Money is
+# also a real observation feature, so pairs recorded after drift begins
+# carry a slightly wrong state -- money_drift_at marks where, so BC can
+# filter or down-weight them.
 SOFT_FIELDS = ("money",)
 
 # How far ahead to look when re-aligning to their state stream.
 RESYNC_WINDOW = 4
+
+# Engine complaints that mean THEIR tool call was malformed rather than
+# that our state diverged. Anything else (no room, cannot afford, wrong
+# phase) means the trajectories genuinely parted and must stop the run.
+THEIR_BAD_CALL = re.compile(
+    r"requires card_target|requires between \d+ and \d+ target card")
 
 def compare_state(gs, t, key_of, ante) -> dict:
     """Structured diff of our state against their recorded one.
@@ -218,6 +227,7 @@ def replay(run: Path, collect_pairs: bool) -> dict:
         "n_actions": len(actions), "n_their_states": len(theirs),
         "synced_steps": 0, "diverged_at": None, "divergence": None,
         "money_drift_at": None, "money_drift": None, "resyncs": 0,
+        "their_invalid": 0,
         "illegal_at": None, "illegal": None, "our_final_ante": None,
         "our_won": None, "pairs": 0,
     }
@@ -234,6 +244,7 @@ def replay(run: Path, collect_pairs: bool) -> dict:
                           GamePhase, auto)
             if is_terminal(gs) or won(gs):
                 break
+            terse = {k: v for k, v in args.items() if k != "reasoning"}
             acts = map_action(verb, args, gs, ActionType, FactoredAction)
             if not acts:
                 continue
@@ -254,10 +265,19 @@ def replay(run: Path, collect_pairs: bool) -> dict:
                 for a in acts:
                     step_factored(gs, a)
             except Exception as e:  # noqa: BLE001
-                result["illegal_at"] = i
-                result["illegal"] = f"{verb} {args!r}: {type(e).__name__}: {e}"
                 if collect_pairs and pairs:
                     pairs.pop()      # the pair we just staged is unusable
+                # Their own invalid tool call, which live rejected too --
+                # empty `cards`, or more targets than the consumable
+                # accepts (one model sent 8 targets for a 1-target card).
+                # These are the benchmark's "valid syntax, not executable"
+                # metric; skipping is what live did, so the trajectory is
+                # still on the rails and the run should continue.
+                if THEIR_BAD_CALL.search(str(e)):
+                    result["their_invalid"] += 1
+                    continue
+                result["illegal_at"] = i
+                result["illegal"] = f"{verb} {terse!r}: {type(e).__name__}: {e}"
                 break
 
             # Self-healing alignment. gamestates[i] is USUALLY the state
@@ -288,11 +308,11 @@ def replay(run: Path, collect_pairs: bool) -> dict:
                 hard = {f: v for f, v in diff.items() if f not in SOFT_FIELDS}
                 if soft and result["money_drift_at"] is None:
                     result["money_drift_at"] = i
-                    result["money_drift"] = {"after": f"{verb} {args!r}"[:90],
+                    result["money_drift"] = {"after": f"{verb} {terse!r}"[:90],
                                              "fields": soft}
                 if hard:
                     result["diverged_at"] = i
-                    result["divergence"] = {"after": f"{verb} {args!r}"[:90],
+                    result["divergence"] = {"after": f"{verb} {terse!r}"[:90],
                                             "fields": hard}
                     break
                 if k > tptr:
@@ -307,6 +327,15 @@ def replay(run: Path, collect_pairs: bool) -> dict:
 
 
 def main() -> None:
+    # The console codec is cp1252 on Windows; engine messages and card
+    # labels can carry characters it cannot encode, and a crash in the
+    # REPORTING path would throw away a completed batch.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=None)
     ap.add_argument("--limit", type=int, default=5)
