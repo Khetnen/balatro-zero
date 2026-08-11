@@ -227,6 +227,11 @@ def main() -> None:
     parser.add_argument("--snapshot-min-ante", type=int, default=3)
     parser.add_argument("--pool-cap", type=int, default=300, help="max snapshots kept")
     parser.add_argument(
+        "--clairvoyant", action="store_true",
+        help="rollouts replay the run's TRUE RNG (pre-2026-08-11 behavior) instead "
+             "of determinized honest futures; only for comparisons against old runs",
+    )
+    parser.add_argument(
         "--resume", action="store_true",
         help="load <out>/latest.pt weights before training (optimizer state starts fresh)",
     )
@@ -254,6 +259,7 @@ def main() -> None:
         sims=args.sims, k_max=args.k, depth=args.depth,
         curriculum_frac=args.curriculum_frac, snapshot_min_ante=args.snapshot_min_ante,
         seed_pool_frac=args.seed_pool_frac, guided_frac=args.guided_frac,
+        determinize=not args.clairvoyant,
     )
     seed_pool_path = Path(args.seed_pool) if args.seed_pool else None
     if seed_pool_path is not None:

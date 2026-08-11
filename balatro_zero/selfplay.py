@@ -69,6 +69,11 @@ class SelfPlayConfig:
                                     # card play (see search._batched_rollouts)
     macro_k: int = 0                # offer k whole-blind beam plans as
                                     # ACTIONS at hand nodes (0 = off)
+    determinize: bool = True        # rollout clones get a fresh PRNG seed +
+                                    # reshuffled undrawn deck (honest futures);
+                                    # False = clairvoyant rollouts, the
+                                    # pre-2026-08-11 behavior every earlier
+                                    # checkpoint was trained/evaluated with
     max_moves: int = 400
     stake: int = 1
     back_key: str = "b_red"
@@ -153,6 +158,7 @@ def play_game(
                 root_noise=root_noise,
                 blind_finisher=cfg.blind_finisher,
                 macro_k=cfg.macro_k,
+                determinize=cfg.determinize,
             )
             if res is None:  # unplayable dead-end state — treat as game over
                 break

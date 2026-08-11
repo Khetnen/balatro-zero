@@ -38,9 +38,16 @@ ante 8).
 
 ## Known simplifications (deliberate, revisit later)
 
-- Search is **clairvoyant** on the run's true seed (no determinization of
-  hidden future RNG). Fine for a difficulty-reference policy; a "blind"
-  determinized variant is future work.
+- Search rollouts are **determinized** by default since 2026-08-11: each
+  simulation clone gets a fresh PRNG seed and a reshuffled undrawn deck
+  (`state.determinize`), so the agent plays under honest uncertainty.
+  `--clairvoyant` (train) / `params clairvoyant=True` (probes) restore the
+  old truth-peeking rollouts — which is how every checkpoint before that
+  date was trained and evaluated, so their recorded numbers are
+  clairvoyant numbers. The gold probe stays clairvoyant by design (it is
+  the difficulty ladder's upper anchor). The beam paths (`macro_k`,
+  `blind_finisher`) plan against the clone's sampled order — no longer
+  the true future, but still clairvoyant *within* their sample.
 - No tree reuse below the root; rollouts are policy-greedy with depth cap.
 - Worker inference is per-position CPU; batched GPU inference across
   parallel games is the big future throughput win.

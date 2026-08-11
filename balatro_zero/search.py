@@ -14,10 +14,15 @@ Per decision:
      tiny simulation budgets.
 
 Simplifications vs the paper: no tree reuse below the root, no
-non-root Gumbel; transitions on a fixed seed are deterministic, so the
-search is clairvoyant about this run's future RNG (documented choice —
-fine for a difficulty-extraction reference policy; a determinized
-"blind" variant can come later).
+non-root Gumbel.
+
+Rollout futures are DETERMINIZED by default: each simulation's clone
+gets a fresh PRNG seed and a reshuffled undrawn deck (state.determinize)
+before the candidate is applied, so Q-values are Monte Carlo estimates
+over honest futures rather than readings of this run's true one.
+determinize=False restores clairvoyant rollouts — the gold probe's
+design point, and how every checkpoint before 2026-08-11 was trained
+and evaluated (their recorded numbers are clairvoyant numbers).
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ from balatro_zero.state import (
     Obs,
     blinds_beaten,
     clone,
+    determinize as _determinize,
     is_terminal,
     legal_factored,
     observe,
@@ -112,6 +118,8 @@ def _batched_rollouts(
     econ_root: bool,
     depth: int,
     blind_finisher: bool = False,
+    determinize_futures: bool = False,
+    rng: np.random.Generator | None = None,
 ) -> list[float]:
     """Run one simulation per entry of sim_specs, batching net evaluations.
 
@@ -134,6 +142,12 @@ def _batched_rollouts(
     states = []
     for a_idx in sim_specs:
         sim = clone(gs)
+        # Determinize BEFORE applying the candidate: its consequences (the
+        # cards a discard draws into, what a pack contains) must be sampled,
+        # not read off the run's true future. Successive draws from the same
+        # generator give each simulation an independent future.
+        if determinize_futures:
+            _determinize(sim, rng)
         _apply(sim, actions[a_idx])
         states.append(sim)
 
@@ -273,6 +287,7 @@ def gumbel_search(
     root_noise: bool = True,
     blind_finisher: bool = False,
     macro_k: int = 0,
+    determinize: bool = True,
 ) -> SearchResult | None:
     actions: list[Any] = legal_factored(gs)
     if macro_k > 1 and gs.get("phase") == GamePhase.SELECTING_HAND:
@@ -327,7 +342,9 @@ def gumbel_search(
         per = max(1, sims_left // (m * (rounds - r)))
         specs = [a for a in candidates for _ in range(per)]
         vals = _batched_rollouts(
-            gs, actions, specs, net, device, econ_root=econ_root, depth=depth
+            gs, actions, specs, net, device, econ_root=econ_root, depth=depth,
+            blind_finisher=blind_finisher,
+            determinize_futures=determinize, rng=rng,
         )
         for a, v in zip(specs, vals):
             q_sum[a] += v

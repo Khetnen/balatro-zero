@@ -21,6 +21,7 @@ import numpy as np
 
 from jackdaw.engine.actions import GamePhase
 from jackdaw.engine.game import step as _engine_step
+from jackdaw.engine.rng import PseudoRandom
 from jackdaw.engine.run_init import initialize_run
 from jackdaw.env.action_space import (
     ActionType,
@@ -94,6 +95,52 @@ def new_run(seed: str, back_key: str = "b_red", stake: int = 1) -> dict[str, Any
 
 def clone(gs: dict[str, Any]) -> dict[str, Any]:
     return pickle.loads(pickle.dumps(gs, protocol=5))
+
+
+# Vanilla seed alphabet: digits 1-9, letters A-N and P-Z (no 0 or O),
+# matching rng.generate_starting_seed.
+_FRESH_SEED_CHARS = "123456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
+
+
+def determinize(gs: dict[str, Any], rng: np.random.Generator) -> None:
+    """Re-randomize everything the player has not observed, in place.
+
+    A rollout clone carries the run's PRNG streams, so stepping it replays
+    this run's TRUE future (draws, shop rolls, pack contents) — naive
+    search is clairvoyant. Applied to a clone, this turns it into a sample
+    from the honest distribution instead:
+
+      * the PRNG is replaced wholesale under a fresh random seed — every
+        stream lazily re-initializes from it on next touch, so all future
+        rolls (shops, packs, next-ante bosses, probability jokers) become
+        fresh samples in one stroke;
+      * the undrawn deck is reshuffled — deck ORDER is the one piece of
+        future that is materialized in state rather than rolled on demand.
+        The multiset is untouched (deck composition is public information).
+
+    Everything already observed — hand, jokers, the current shop/pack
+    contents, this ante's boss and tags — is concrete objects in the state
+    dict and is not touched by either step.
+
+    Known residuals (documented, deliberately unfixed): the current ante's
+    shop voucher key is pre-rolled at ante start, so a rollout entering a
+    not-yet-visited shop sees the true one; boss-flipped face-down hand
+    cards are materialized. Both are single items with small stakes.
+
+    Strictly, the honest posterior is "futures from seeds consistent with
+    the observed history," not "a fresh seed" — but the hash streams are
+    near-independent, and fresh-seed sampling is what determinization
+    means in the MCTS literature.
+    """
+    fresh = "".join(
+        _FRESH_SEED_CHARS[i]
+        for i in rng.integers(0, len(_FRESH_SEED_CHARS), size=8)
+    )
+    gs["rng"] = PseudoRandom(fresh)
+    deck = gs.get("deck") or []
+    if len(deck) > 1:
+        order = rng.permutation(len(deck))
+        deck[:] = [deck[i] for i in order]
 
 
 def step_factored(gs: dict[str, Any], action: FactoredAction) -> None:

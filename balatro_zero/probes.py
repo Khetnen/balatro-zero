@@ -9,7 +9,11 @@ stochastic through Gumbel root noise.
 Probe kinds:
   chip_greedy — engine-exact greedy hand play, buys nothing (the no-economy floor)
   router      — full scripted router (flush build + priority economy)
-  net         — checkpoint + Gumbel search (sims/depth), root noise on
+  net         — checkpoint + Gumbel search (sims/depth), root noise on;
+                rollouts are DETERMINIZED (honest futures) unless
+                params clairvoyant=True. Every net-probe artifact recorded
+                before 2026-08-11 used clairvoyant rollouts — do not mix
+                the two under one probe name.
 
 Each rollout's rng is derived from (probe, seed, rollout) so results are
 reproducible and resumable record-by-record.
@@ -121,14 +125,16 @@ def _scripted_game(seed: str, rng: np.random.Generator, eps: float,
 def _net_game(seed: str, rng: np.random.Generator, ckpt: str,
               sims: int, depth: int,
               blind_finisher: bool = False,
-              macro_k: int = 0) -> dict[str, Any]:
+              macro_k: int = 0,
+              clairvoyant: bool = False) -> dict[str, Any]:
     import torch
 
     from balatro_zero.selfplay import SelfPlayConfig, play_game
 
     net = _get_net(ckpt)
     cfg = SelfPlayConfig(sims=sims, k_max=min(8, max(2, sims)), depth=depth,
-                         blind_finisher=blind_finisher, macro_k=macro_k)
+                         blind_finisher=blind_finisher, macro_k=macro_k,
+                         determinize=not clairvoyant)
     _, st, _ = play_game(
         net, torch.device("cpu"), seed, cfg, rng, root_noise=True
     )
@@ -150,6 +156,7 @@ def run_probe_game(spec: ProbeSpec, seed: str, rollout: int) -> dict[str, Any]:
             int(spec.params.get("sims", 32)), int(spec.params.get("depth", 1)),
             bool(spec.params.get("blind_finisher", False)),
             int(spec.params.get("macro_k", 0)),
+            bool(spec.params.get("clairvoyant", False)),
         )
     elif spec.kind == "gold":
         from balatro_zero.goldprobe import gold_game
