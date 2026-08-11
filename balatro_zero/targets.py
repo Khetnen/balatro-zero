@@ -31,7 +31,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from balatro_zero.net import MAX_ENTITY_SLOTS, N_HAND_SLOTS
+from balatro_zero.net import (
+    MAX_ENTITY_SLOTS,
+    N_HAND_SLOTS,
+    global_entity_slot,
+)
 
 
 @dataclass
@@ -47,7 +51,10 @@ class CandidateSet:
 
 
 def encode_candidates(
-    actions: Sequence[Any], pi: np.ndarray, n_hand: int
+    actions: Sequence[Any],
+    pi: np.ndarray,
+    n_hand: int,
+    market_lens: tuple[int, int, int] | None = None,
 ) -> CandidateSet:
     """Compress a root's action list + improved policy into a CandidateSet.
 
@@ -57,6 +64,11 @@ def encode_candidates(
     index beyond ``min(n_hand, N_HAND_SLOTS)`` is ignored (bit dropped
     here, membership loop bounded there). A MacroPlan is scored by its
     opening move, like ``search._head_action``.
+
+    ``market_lens`` selects the entity layout and must match the net the
+    samples will train: None = legacy per-area index (V5); the root's
+    ``net.market_area_lens(gs)`` = the global 28-slot layout (V6,
+    GLOBAL_ENTITY nets), where the slot index is net.global_entity_slot.
     """
     k = len(actions)
     types = np.empty(k, dtype=np.uint8)
@@ -66,9 +78,14 @@ def encode_candidates(
     for i, a in enumerate(actions):
         head = a.seq[0] if hasattr(a, "seq") else a
         types[i] = int(head.action_type)
-        e = head.entity_target
-        if e is not None and 0 <= int(e) < MAX_ENTITY_SLOTS:
-            entities[i] = int(e)
+        if market_lens is not None:
+            g = global_entity_slot(head, market_lens)
+            if g is not None:
+                entities[i] = g
+        else:
+            e = head.entity_target
+            if e is not None and 0 <= int(e) < MAX_ENTITY_SLOTS:
+                entities[i] = int(e)
         tgt = head.card_target
         if tgt is not None and len(tgt) > 0:
             has_cards[i] = True

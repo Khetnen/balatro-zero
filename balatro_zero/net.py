@@ -22,7 +22,19 @@ import numpy as np
 import torch
 from torch import nn
 
-from balatro_zero.state import MAX_ACTIONS, N_EMBED, OBS_DIM, Obs, stack_obs
+from balatro_zero.state import (
+    HAND_FLAT_DIM,
+    HAND_FLAT_OFFSET,
+    HAND_FLAT_ROWS,
+    MAX_ACTIONS,
+    N_CONSUMABLE_SLOTS,
+    N_EMBED,
+    N_JOKER_SLOTS,
+    N_MARKET_SLOTS,
+    OBS_DIM,
+    Obs,
+    stack_obs,
+)
 
 WIN_WEIGHT = 0.5
 PROGRESS_WEIGHT = 0.5
@@ -130,7 +142,12 @@ class JokerEncoder(nn.Module):
         self.attn = nn.TransformerEncoder(enc, num_layers=layers)
         self.out_dim = 2 * d_model
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+    def tokens(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Contextualised per-slot tokens -> (h [B,S,d], pad mask, empty rows).
+
+        Exposed separately from forward() so a pointer head can score
+        individual joker SLOTS from content; forward() pools these.
+        """
         b, s = ids.shape
         tok = torch.cat([self.embed(ids), self.desc[ids]], dim=-1)
         h = self.proj(tok) + self.pos.weight[:s].unsqueeze(0)
@@ -143,7 +160,10 @@ class JokerEncoder(nn.Module):
         pad = pad.clone()
         pad[empty, 0] = False
         h = self.attn(h, src_key_padding_mask=pad)
+        return h, pad, empty
 
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        h, pad, empty = self.tokens(ids)
         keep = (~pad).unsqueeze(-1).float()
         count = keep.sum(dim=1).clamp(min=1.0)
         mean = (h * keep).sum(dim=1) / count
@@ -250,13 +270,180 @@ class PolicyValueNetV5(PolicyValueNetV4):
         )
 
 
-def action_logit(type_lg, ent_lg, card_lg, action, n_hand: int) -> float:
+class PolicyValueNetV6(PolicyValueNetV5):
+    """V5 with POINTER heads: entity and card slots scored from content.
+
+    V5's entity head is a Linear over slot indices read from the fused
+    torso vector — but the identity embeddings reach that vector only
+    through permutation-invariant pooling, which destroys WHICH-SLOT
+    information by construction. The only slot-ordered identity signal
+    left is the flat scalar features, and the v1/v2 plateau already
+    measured those as insufficient to rank jokers. So "buy slot 2
+    because slot 2 is Fibonacci" was near-unrepresentable: position
+    instead of content, one level below the policy parameterisation.
+    scripts/binding_probe.py is the falsifiable gate (V5 provably scores
+    0.000 sensitivity to a content swap; V6 tracks it exactly).
+
+    Entity slots live in ONE GLOBAL space (jokers | consumables |
+    market), which also removes V5's cross-area conflation where
+    "sell joker 2" and "buy shop item 2" shared an entity logit. Each
+    slot's score is a scaled dot product between its content
+    representation (joker attention tokens; id embedding + slot
+    position elsewhere) and a query from the fused torso.
+
+    The card head becomes a pointer over the flat obs's per-slot hand
+    rows (rank/suit/enhancement content); hand slots beyond the flat
+    window keep a learned bias so the head width stays N_HAND_SLOTS.
+
+    Known residual (deliberate): plain playing cards all embed as
+    c_base — rank/suit identity for PACK picks rides only on the flat
+    rows and the torso, same as V5. Fixing it means synthetic per-card
+    embedding ids (breaks old checkpoint shapes); do it as its own step.
+    """
+
+    GLOBAL_ENTITY = True  # encode/scoring use the global 28-slot layout
+
+    def __init__(self, obs_dim: int = OBS_DIM, n_actions: int = MAX_ACTIONS,
+                 hidden: int = 512, depth: int = 3, embed_dim: int = EMBED_DIM,
+                 d_model: int = 64, d_ptr: int = 64) -> None:
+        super().__init__(obs_dim, n_actions, hidden, depth, embed_dim, d_model)
+        # The positional heads this class replaces.
+        del self.entity_head
+        del self.card_head
+
+        self.ent_query = nn.Linear(hidden, d_ptr)
+        self.ent_proj_joker = nn.Linear(d_model, d_ptr)
+        self.ent_proj_cons = nn.Linear(embed_dim, d_ptr)
+        self.ent_proj_market = nn.Linear(embed_dim, d_ptr)
+        self.ent_pos = nn.Embedding(GLOBAL_ENTITY_SLOTS, d_ptr)
+
+        self.card_query = nn.Linear(hidden, d_ptr)
+        self.card_proj = nn.Linear(HAND_FLAT_DIM, d_ptr)
+        self.card_pos = nn.Embedding(HAND_FLAT_ROWS, d_ptr)
+        # Hand slots beyond the flat window (9-16) have no per-slot
+        # content anywhere in the obs; a learned bias keeps the head
+        # width at N_HAND_SLOTS without pretending content exists.
+        self.card_tail = nn.Parameter(torch.zeros(N_HAND_SLOTS - HAND_FLAT_ROWS))
+        self._scale = d_ptr ** -0.5
+
+    def forward(self, flat, joker_ids, consumable_ids, market_ids):
+        h = self.torso(flat)
+        jtok, jpad, jempty = self.jokers.tokens(joker_ids)
+        keep = (~jpad).unsqueeze(-1).float()
+        count = keep.sum(dim=1).clamp(min=1.0)
+        jmean = (jtok * keep).sum(dim=1) / count
+        jmax = torch.where(keep > 0, jtok, torch.full_like(jtok, -1e9)).max(dim=1).values
+        jpool = torch.cat([jmean, jmax], dim=-1)
+        jpool = torch.where(jempty.unsqueeze(-1), torch.zeros_like(jpool), jpool)
+        pooled = torch.cat(
+            [
+                jpool,
+                _pool(self.embed(consumable_ids), consumable_ids),
+                _pool(self.embed(market_ids), market_ids),
+            ],
+            dim=-1,
+        )
+        h = self.fuse(torch.cat([h, pooled], dim=-1))
+
+        slots = torch.cat(
+            [
+                self.ent_proj_joker(jtok),
+                self.ent_proj_cons(self.embed(consumable_ids)),
+                self.ent_proj_market(self.embed(market_ids)),
+            ],
+            dim=1,
+        ) + self.ent_pos.weight.unsqueeze(0)
+        ent_lg = torch.einsum("bsd,bd->bs", slots, self.ent_query(h)) * self._scale
+
+        b = flat.shape[0]
+        rows = flat[:, HAND_FLAT_OFFSET:
+                    HAND_FLAT_OFFSET + HAND_FLAT_ROWS * HAND_FLAT_DIM]
+        rows = rows.reshape(b, HAND_FLAT_ROWS, HAND_FLAT_DIM)
+        hand_slots = self.card_proj(rows) + self.card_pos.weight.unsqueeze(0)
+        card_main = torch.einsum("bsd,bd->bs", hand_slots, self.card_query(h)) * self._scale
+        card_lg = torch.cat(
+            [card_main, self.card_tail.unsqueeze(0).expand(b, -1)], dim=-1
+        )
+
+        return (
+            self.type_head(h),
+            ent_lg,
+            card_lg,
+            torch.sigmoid(self.win(h)).squeeze(-1),
+            torch.sigmoid(self.progress(h)).squeeze(-1),
+        )
+
+
+# --- Global entity layout (V6) --------------------------------------------
+# One slot space shared by every entity-targeted action type, so no two
+# areas share a logit: [ jokers 0-11 | consumables 12-15 | market 16-27 ].
+# The market's internal offsets (cards | vouchers | boosters | pack) vary
+# per state, so translation needs the area lengths from the game state.
+
+ENT_OFF_JOKER = 0
+ENT_OFF_CONS = N_JOKER_SLOTS
+ENT_OFF_MARKET = N_JOKER_SLOTS + N_CONSUMABLE_SLOTS
+GLOBAL_ENTITY_SLOTS = ENT_OFF_MARKET + N_MARKET_SLOTS  # 28
+
+
+def market_area_lens(gs) -> tuple[int, int, int]:
+    """(n shop cards, n vouchers, n boosters) — the market's live layout."""
+    return (
+        len(gs.get("shop_cards", [])),
+        len(gs.get("shop_vouchers", [])),
+        len(gs.get("shop_boosters", [])),
+    )
+
+
+def global_entity_slot(action, lens: tuple[int, int, int]) -> int | None:
+    """Map (action type, within-area entity index) -> global slot, or None.
+
+    Mirrors observe()'s market packing (shop cards + vouchers + boosters
+    + pack contents) so the slot the pointer scores is the slot whose
+    embedding the net saw. Out-of-window targets return None and the
+    entity factor contributes nothing — same convention as everywhere.
+    """
+    from jackdaw.env.action_space import ActionType
+
+    e = action.entity_target
+    if e is None:
+        return None
+    e = int(e)
+    t = int(action.action_type)
+    if t == ActionType.SellJoker:
+        g = ENT_OFF_JOKER + e if e < N_JOKER_SLOTS else None
+    elif t in (ActionType.SellConsumable, ActionType.UseConsumable):
+        g = ENT_OFF_CONS + e if e < N_CONSUMABLE_SLOTS else None
+    elif t == ActionType.BuyCard:
+        g = ENT_OFF_MARKET + e
+    elif t == ActionType.RedeemVoucher:
+        g = ENT_OFF_MARKET + lens[0] + e
+    elif t == ActionType.OpenBooster:
+        g = ENT_OFF_MARKET + lens[0] + lens[1] + e
+    elif t == ActionType.PickPackCard:
+        g = ENT_OFF_MARKET + lens[0] + lens[1] + lens[2] + e
+    else:
+        return None
+    if g is None or g >= GLOBAL_ENTITY_SLOTS:
+        return None
+    return g
+
+
+def action_logit(type_lg, ent_lg, card_lg, action, n_hand: int,
+                 ent_slot: int | None = None) -> float:
     """Prior score for one FactoredAction under the factored heads.
 
     Card sets use a Bernoulli set log-probability over the live hand
     slots -- included slots contribute log sigma(z), excluded ones
     log(1 - sigma(z)) -- so every subset is scored, not just enumerated
     ones, and a 5-card play is not penalised merely for being large.
+
+    ``ent_slot`` selects the entity convention: None = legacy (V5) nets,
+    raw within-area index bounds-checked against the head; for
+    global-entity (V6) nets pass the pre-mapped global slot, or -1 when
+    global_entity_slot returned None — the entity factor then contributes
+    NOTHING (falling back to the raw index would read a joker slot's
+    logit for a shop action).
     """
     import numpy as np
 
@@ -272,9 +459,13 @@ def action_logit(type_lg, ent_lg, card_lg, action, n_hand: int) -> float:
     # any action without one regardless of what the net actually thought.
     t = int(action.action_type)
     score = float(_log_softmax(type_lg)[t])
-    e = action.entity_target
-    if e is not None and 0 <= int(e) < len(ent_lg):
-        score += float(_log_softmax(ent_lg)[int(e)])
+    if ent_slot is not None:
+        if int(ent_slot) >= 0:
+            score += float(_log_softmax(ent_lg)[int(ent_slot)])
+    else:
+        e = action.entity_target
+        if e is not None and 0 <= int(e) < len(ent_lg):
+            score += float(_log_softmax(ent_lg)[int(e)])
     tgt = action.card_target
     if tgt:
         sel = set(int(i) for i in tgt)
@@ -309,7 +500,9 @@ def load_net(ckpt: str, device: str = "cpu") -> PolicyValueNet:
     than storing a flag, which old checkpoints would not have.
     """
     sd = torch.load(ckpt, map_location=device, weights_only=True)
-    if any(k.startswith("type_head.") for k in sd):
+    if any(k.startswith("ent_query.") for k in sd):
+        net = PolicyValueNetV6()  # check before V5: V6 also has type_head
+    elif any(k.startswith("type_head.") for k in sd):
         net = PolicyValueNetV5()
     elif any(k.startswith("jokers.") for k in sd):
         net = PolicyValueNetV4()

@@ -80,6 +80,14 @@ OBS_DIM: int = (
     + len(_ENTITY_INFO)
 )
 
+# Layout of the per-slot hand rows inside the flat vector (obs_vector
+# concatenates global context, then each entity area's padded rows in
+# _ENTITY_INFO order). The V6 card pointer reads hand content from here.
+assert _ENTITY_INFO[0][0] == "hand_card", _ENTITY_INFO[0]
+HAND_FLAT_OFFSET: int = _SPEC.global_feature_dim
+HAND_FLAT_ROWS: int = _ENTITY_INFO[0][1]   # 8
+HAND_FLAT_DIM: int = _ENTITY_INFO[0][2]    # 15
+
 # Combo subsampling must be deterministic per process so a node enumerated
 # twice sees the same action list (targets/indices stay aligned).
 _combo_rng = np.random.default_rng(0)

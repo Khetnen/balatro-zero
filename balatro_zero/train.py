@@ -29,6 +29,7 @@ from balatro_zero.net import (
     PolicyValueNet,
     PolicyValueNetV4,
     PolicyValueNetV5,
+    PolicyValueNetV6,
     is_factored,
     load_net,
 )
@@ -42,7 +43,8 @@ from balatro_zero.selfplay import (
 )
 from balatro_zero.targets import collate_candidate_sets, factored_policy_loss
 
-ARCHS = {"v3": PolicyValueNet, "v4": PolicyValueNetV4, "v5": PolicyValueNetV5}
+ARCHS = {"v3": PolicyValueNet, "v4": PolicyValueNetV4,
+         "v5": PolicyValueNetV5, "v6": PolicyValueNetV6}
 
 
 def train_epochs(
@@ -246,9 +248,11 @@ def main() -> None:
     parser.add_argument("--snapshot-min-ante", type=int, default=3)
     parser.add_argument("--pool-cap", type=int, default=300, help="max snapshots kept")
     parser.add_argument(
-        "--arch", choices=sorted(ARCHS), default="v5",
+        "--arch", choices=sorted(ARCHS), default="v6",
         help="network for FRESH runs (--resume sniffs the checkpoint instead): "
-             "v5 = factored policy (content-supervised), v3/v4 = positional Discrete(500)",
+             "v6 = factored + pointer entity/card heads (content-bound), "
+             "v5 = factored with positional-input heads, "
+             "v3/v4 = positional Discrete(500)",
     )
     parser.add_argument(
         "--clairvoyant", action="store_true",

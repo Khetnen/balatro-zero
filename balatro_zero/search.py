@@ -40,7 +40,9 @@ from balatro_zero.net import (
     action_logit,
     evaluate,
     evaluate_factored,
+    global_entity_slot,
     is_factored,
+    market_area_lens,
 )
 from jackdaw.engine.actions import GamePhase
 
@@ -245,12 +247,22 @@ def _priors(net, obs_list, states, action_lists, device):
         return [lg[i, : len(action_lists[i])].astype(np.float64)
                 for i in range(len(action_lists))], v
     tl, el, cl, v = evaluate_factored(net, obs_list, device)
+    global_ent = getattr(net, "GLOBAL_ENTITY", False)
     out = []
     for i, acts in enumerate(action_lists):
         n_hand = len(states[i].get("hand", []))
-        out.append(np.array(
-            [action_logit(tl[i], el[i], cl[i], _head_action(a), n_hand)
-             for a in acts], dtype=np.float64))
+        lens = market_area_lens(states[i]) if global_ent else None
+        row = []
+        for a in acts:
+            head = _head_action(a)
+            if global_ent:
+                s = global_entity_slot(head, lens)
+                slot = s if s is not None else -1  # -1: no entity factor
+            else:
+                slot = None  # legacy within-area convention
+            row.append(action_logit(tl[i], el[i], cl[i], head, n_hand,
+                                    ent_slot=slot))
+        out.append(np.asarray(row, dtype=np.float64))
     return out, v
 
 

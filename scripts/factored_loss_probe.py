@@ -30,8 +30,10 @@ from jackdaw.env.game_spec import FactoredAction
 from balatro_zero.net import (
     PolicyValueNetV4,
     PolicyValueNetV5,
+    PolicyValueNetV6,
     action_logit,
     evaluate_factored,
+    global_entity_slot,
     is_factored,
     load_net,
 )
@@ -57,13 +59,27 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
-def reference_loss(net, obs_list, action_lists, pi_list, n_hands) -> float:
-    """Slow float64 reference: action_logit per candidate, then set CE."""
+def reference_loss(net, obs_list, action_lists, pi_list, n_hands,
+                   lens_list=None) -> float:
+    """Slow float64 reference: action_logit per candidate, then set CE.
+
+    lens_list supplies per-sample market area lengths for global-entity
+    (V6) nets, whose entity factor indexes the joint 28-slot layout.
+    """
     t_lg, e_lg, c_lg, _ = evaluate_factored(net, obs_list, torch.device("cpu"))
     total = 0.0
     for i, (acts, pi, nh) in enumerate(zip(action_lists, pi_list, n_hands)):
+        lens = lens_list[i] if lens_list is not None else None
+
+        def _slot(a):
+            if lens is None:
+                return None
+            s = global_entity_slot(a, lens)
+            return s if s is not None else -1
+
         scores = np.array(
-            [action_logit(t_lg[i], e_lg[i], c_lg[i], a, nh) for a in acts],
+            [action_logit(t_lg[i], e_lg[i], c_lg[i], a, nh, ent_slot=_slot(a))
+             for a in acts],
             dtype=np.float64,
         )
         logp = scores - scores.max()
@@ -147,6 +163,33 @@ def main() -> int:
     fast = batched_loss(net, [obs_list[0]], [one])
     check("K=1 set gives zero loss", abs(fast) < 1e-6, f"{fast:.2e}")
 
+    # V6 (global entity layout): same equivalence, entity slots mapped
+    # through global_entity_slot with per-state market area lengths.
+    net6 = PolicyValueNetV6()
+    net6.eval()
+    lens6 = (2, 1, 2)
+    v6_actions = edge_actions  # covers every area type incl. out-of-window
+    for nh in (0, 8):
+        w = rng.dirichlet(np.ones(len(v6_actions))).astype(np.float32)
+        ref = reference_loss(net6, [obs_list[0]], [v6_actions], [w], [nh],
+                             lens_list=[lens6])
+        fast = batched_loss(net6, [obs_list[0]],
+                            [encode_candidates(v6_actions, w, nh,
+                                               market_lens=lens6)])
+        check(f"V6 global-entity match at n_hand={nh}", abs(ref - fast) < 1e-4,
+              f"ref {ref:.6f} vs batched {fast:.6f}")
+    real_lens = [(0, 0, 0)] * len(states)  # no shop at these roots
+    w_list = [rng.dirichlet(np.ones(len(a))).astype(np.float32)
+              for a in action_lists]
+    ref = reference_loss(net6, obs_list, action_lists, w_list, n_hands,
+                         lens_list=real_lens)
+    fast = batched_loss(net6, obs_list,
+                        [encode_candidates(a, w, nh, market_lens=ln)
+                         for a, w, nh, ln in zip(action_lists, w_list,
+                                                 n_hands, real_lens)])
+    check("V6 real candidate sets match", abs(ref - fast) < 1e-4,
+          f"ref {ref:.6f} vs batched {fast:.6f}")
+
     # ---- 2. gradient -------------------------------------------------------
     # A Dirichlet target is NOT representable by the factored family (the
     # Bernoulli card factor cannot encode an arbitrary distribution over
@@ -196,6 +239,12 @@ def main() -> int:
           len(samples4) > 0
           and all(isinstance(s[1], np.ndarray) for s in samples4),
           f"{len(samples4)} samples")
+    samples6, _, _ = play_game(net6, torch.device("cpu"), "FLPROBE6", cfg,
+                               np.random.default_rng(5))
+    check("V6 emits CandidateSets end-to-end",
+          len(samples6) > 0
+          and all(isinstance(s[1], CandidateSet) for s in samples6),
+          f"{len(samples6)} samples")
 
     # ---- 4. end-to-end ------------------------------------------------------
     print("4. end-to-end (buffer -> train_epochs -> load_net)")
@@ -211,6 +260,17 @@ def main() -> int:
           f"policy {losses['policy']:.3f} win {losses['win']:.3f} "
           f"prog {losses['progress']:.3f}")
 
+    buffer6 = ReplayBuffer(capacity=1000)
+    buffer6.add(samples6)
+    train6 = PolicyValueNetV6()
+    opt6 = torch.optim.Adam(train6.parameters(), lr=1e-3)
+    losses6 = train_epochs(train6, opt6, buffer6, epochs=2, batch_size=8,
+                           device=torch.device("cpu"),
+                           rng=np.random.default_rng(6))
+    check("train_epochs runs on V6 samples",
+          all(np.isfinite(v) for v in losses6.values()),
+          f"policy {losses6['policy']:.3f}")
+
     import tempfile
     from pathlib import Path
 
@@ -220,6 +280,12 @@ def main() -> int:
         loaded = load_net(str(p))
         check("load_net round-trips the trained V5",
               type(loaded).__name__ == "PolicyValueNetV5" and is_factored(loaded))
+        p6 = Path(td) / "v6.pt"
+        torch.save(train6.state_dict(), p6)
+        loaded6 = load_net(str(p6))
+        check("load_net round-trips V6 (sniffed before V5)",
+              type(loaded6).__name__ == "PolicyValueNetV6"
+              and getattr(loaded6, "GLOBAL_ENTITY", False))
 
     if FAILURES:
         print(f"\nGATE FAILED: {len(FAILURES)} check(s): {FAILURES}")

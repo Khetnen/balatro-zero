@@ -29,7 +29,12 @@ from typing import Any
 import numpy as np
 import torch
 
-from balatro_zero.net import PolicyValueNet, is_factored, load_net
+from balatro_zero.net import (
+    PolicyValueNet,
+    is_factored,
+    load_net,
+    market_area_lens,
+)
 from balatro_zero.router import ECON_PHASES, scripted_econ_action
 from balatro_zero.search import _apply, gumbel_search
 from balatro_zero.targets import encode_candidates
@@ -128,6 +133,10 @@ def play_game(
     # not a positional pi vector — a positional index means nothing to a
     # net that scores actions from type/entity/card factors.
     factored = is_factored(net)
+    # Global-entity (V6) nets score entities in the joint 28-slot layout;
+    # their targets must be encoded in the same layout, which needs the
+    # market's live area lengths at each decision.
+    global_ent = getattr(net, "GLOBAL_ENTITY", False)
     positions: list[tuple[Obs, Any, float]] = []  # (obs, target, progress@root)
     snapshots: list[bytes] = []
     max_ante_seen = last_snap_ante = ante(gs)
@@ -155,7 +164,8 @@ def play_game(
                         w = np.zeros(len(legal), dtype=np.float32)
                         w[idx] = 1.0
                         tgt = encode_candidates(
-                            legal, w, len(gs.get("hand", []))
+                            legal, w, len(gs.get("hand", [])),
+                            market_lens=market_area_lens(gs) if global_ent else None,
                         )
                     else:
                         tgt = np.zeros(MAX_ACTIONS, dtype=np.float32)
@@ -183,6 +193,7 @@ def play_game(
                     res.actions,
                     res.pi_target[: len(res.actions)],
                     len(gs.get("hand", [])),
+                    market_lens=market_area_lens(gs) if global_ent else None,
                 )
             else:
                 tgt = res.pi_target
