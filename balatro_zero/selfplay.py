@@ -29,9 +29,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from balatro_zero.net import PolicyValueNet
+from balatro_zero.net import PolicyValueNet, is_factored, load_net
 from balatro_zero.router import ECON_PHASES, scripted_econ_action
 from balatro_zero.search import _apply, gumbel_search
+from balatro_zero.targets import encode_candidates
 from balatro_zero.state import (
     MAX_ACTIONS,
     Obs,
@@ -116,13 +117,18 @@ def play_game(
     root_noise: bool = True,
     start_state: dict[str, Any] | None = None,
     guided: bool = False,
-) -> tuple[list[tuple[Obs, np.ndarray, float, float]], GameStats, list[bytes]]:
+) -> tuple[list[tuple[Obs, Any, float, float]], GameStats, list[bytes]]:
     if start_state is not None:
         gs = clone(start_state)
     else:
         gs = new_run(seed, back_key=cfg.back_key, stake=cfg.stake)
 
-    positions: list[tuple[Obs, np.ndarray, float]] = []  # (obs, pi, progress@root)
+    # Factored (V5) nets are supervised by CONTENT: the target is the
+    # improved policy over the root's candidate set (targets.CandidateSet),
+    # not a positional pi vector — a positional index means nothing to a
+    # net that scores actions from type/entity/card factors.
+    factored = is_factored(net)
+    positions: list[tuple[Obs, Any, float]] = []  # (obs, target, progress@root)
     snapshots: list[bytes] = []
     max_ante_seen = last_snap_ante = ante(gs)
     max_progress = progress(gs)
@@ -142,9 +148,19 @@ def play_game(
                 except ValueError:
                     idx = -1
                 if idx >= 0:
-                    pi = np.zeros(MAX_ACTIONS, dtype=np.float32)
-                    pi[idx] = 1.0
-                    positions.append((observe(gs), pi, progress(gs)))
+                    if factored:
+                        # One-hot over the FULL legal set: "this action,
+                        # not the others" — a K=1 set would carry no
+                        # gradient through the candidate softmax.
+                        w = np.zeros(len(legal), dtype=np.float32)
+                        w[idx] = 1.0
+                        tgt = encode_candidates(
+                            legal, w, len(gs.get("hand", []))
+                        )
+                    else:
+                        tgt = np.zeros(MAX_ACTIONS, dtype=np.float32)
+                        tgt[idx] = 1.0
+                    positions.append((observe(gs), tgt, progress(gs)))
                     action = scripted
         if action is None:
             res = gumbel_search(
@@ -162,7 +178,15 @@ def play_game(
             )
             if res is None:  # unplayable dead-end state — treat as game over
                 break
-            positions.append((res.root_obs, res.pi_target, progress(gs)))
+            if factored:
+                tgt = encode_candidates(
+                    res.actions,
+                    res.pi_target[: len(res.actions)],
+                    len(gs.get("hand", [])),
+                )
+            else:
+                tgt = res.pi_target
+            positions.append((res.root_obs, tgt, progress(gs)))
             action = res.actions[res.action_idx]
         # _apply, not step_factored: a chosen macro plan is a whole-blind
         # line and must be executed in full.
@@ -216,18 +240,18 @@ def worker_run(
     cfg: SelfPlayConfig,
     pool_path: str | None = None,
     seed_pool_path: str | None = None,
-) -> tuple[list[tuple[Obs, np.ndarray, float, float]], list[GameStats], list[bytes]]:
+) -> tuple[list[tuple[Obs, Any, float, float]], list[GameStats], list[bytes]]:
     torch.set_num_threads(1)
     device = torch.device("cpu")
-    net = PolicyValueNet()
-    net.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
-    net.eval()
+    # load_net sniffs the architecture from the state dict — constructing
+    # the base class here crashed outright on any V4/V5 checkpoint.
+    net = load_net(str(ckpt_path))
 
     pool = _load_pool(pool_path)
     seed_pool = _load_pool(seed_pool_path)
 
     rng = np.random.default_rng(worker_id * 100_003 + 17)
-    all_samples: list[tuple[Obs, np.ndarray, float, float]] = []
+    all_samples: list[tuple[Obs, Any, float, float]] = []
     stats: list[GameStats] = []
     new_snapshots: list[bytes] = []
     for i in range(n_games):

@@ -25,7 +25,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from balatro_zero.net import PolicyValueNet
+from balatro_zero.net import (
+    PolicyValueNet,
+    PolicyValueNetV4,
+    PolicyValueNetV5,
+    is_factored,
+    load_net,
+)
 from balatro_zero.replay import ReplayBuffer
 from balatro_zero.selfplay import (
     GameStats,
@@ -34,6 +40,9 @@ from balatro_zero.selfplay import (
     sample_start_state,
     worker_run,
 )
+from balatro_zero.targets import collate_candidate_sets, factored_policy_loss
+
+ARCHS = {"v3": PolicyValueNet, "v4": PolicyValueNetV4, "v5": PolicyValueNetV5}
 
 
 def train_epochs(
@@ -50,6 +59,7 @@ def train_epochs(
     demo_frac: float = 0.0,
 ) -> dict[str, float]:
     net.train()
+    factored = is_factored(net)
     n_batches_per_epoch = max(1, len(buffer) // batch_size)
     losses: dict[str, float] = {"policy": 0.0, "win": 0.0, "progress": 0.0}
     n_steps = 0
@@ -61,21 +71,30 @@ def train_epochs(
             flat, jid, cid, mid, pi, z_win, z_prog = buffer.sample(batch_size - n_demo, rng)
             if n_demo:
                 parts = demo_buffer.sample(n_demo, rng)
-                flat, jid, cid, mid, pi, z_win, z_prog = (
+                # Policy targets concatenate as arrays (positional) or
+                # lists (factored CandidateSets); everything else is arrays.
+                pi = (pi + parts[4]) if factored else np.concatenate([pi, parts[4]])
+                flat, jid, cid, mid, z_win, z_prog = (
                     np.concatenate([a, b])
-                    for a, b in zip((flat, jid, cid, mid, pi, z_win, z_prog), parts)
+                    for a, b in zip((flat, jid, cid, mid, z_win, z_prog),
+                                    parts[:4] + parts[5:])
                 )
             flat_t = torch.from_numpy(flat).float().to(device)
             jid_t = torch.from_numpy(jid).to(device)
             cid_t = torch.from_numpy(cid).to(device)
             mid_t = torch.from_numpy(mid).to(device)
-            pi_t = torch.from_numpy(pi).to(device)
             z_win_t = torch.from_numpy(z_win).to(device)
             z_prog_t = torch.from_numpy(z_prog).to(device)
 
-            logits, p_win, prog = net(flat_t, jid_t, cid_t, mid_t)
-            log_probs = F.log_softmax(logits, dim=-1)
-            policy_loss = -(pi_t * log_probs).sum(dim=-1).mean()
+            if factored:
+                type_lg, ent_lg, card_lg, p_win, prog = net(flat_t, jid_t, cid_t, mid_t)
+                fb = collate_candidate_sets(pi, device)
+                policy_loss = factored_policy_loss(type_lg, ent_lg, card_lg, fb)
+            else:
+                logits, p_win, prog = net(flat_t, jid_t, cid_t, mid_t)
+                pi_t = torch.from_numpy(pi).to(device)
+                log_probs = F.log_softmax(logits, dim=-1)
+                policy_loss = -(pi_t * log_probs).sum(dim=-1).mean()
             win_loss = F.binary_cross_entropy(p_win, z_win_t)
             progress_loss = F.binary_cross_entropy(prog, z_prog_t)
             loss = policy_loss + win_loss + progress_loss_weight * progress_loss
@@ -227,6 +246,11 @@ def main() -> None:
     parser.add_argument("--snapshot-min-ante", type=int, default=3)
     parser.add_argument("--pool-cap", type=int, default=300, help="max snapshots kept")
     parser.add_argument(
+        "--arch", choices=sorted(ARCHS), default="v5",
+        help="network for FRESH runs (--resume sniffs the checkpoint instead): "
+             "v5 = factored policy (content-supervised), v3/v4 = positional Discrete(500)",
+    )
+    parser.add_argument(
         "--clairvoyant", action="store_true",
         help="rollouts replay the run's TRUE RNG (pre-2026-08-11 behavior) instead "
              "of determinized honest futures; only for comparisons against old runs",
@@ -242,16 +266,21 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / "metrics.jsonl"
 
-    net = PolicyValueNet().to(device)
     resume_path = out_dir / "latest.pt"
     start_it = 1
     if args.resume and resume_path.exists():
-        net.load_state_dict(torch.load(resume_path, map_location=device, weights_only=True))
-        print(f"resumed weights from {resume_path}")
+        # load_net sniffs the architecture, so a resumed run keeps its
+        # net regardless of --arch (they may disagree; the checkpoint wins).
+        net = load_net(str(resume_path)).to(device)
+        net.train()
+        print(f"resumed weights from {resume_path} "
+              f"({type(net).__name__}, factored={is_factored(net)})")
         existing = sorted(out_dir.glob("ckpt_*.pt"))
         if existing:
             start_it = int(existing[-1].stem.split("_")[-1]) + 1
             print(f"continuing iteration numbering at {start_it}")
+    else:
+        net = ARCHS[args.arch]().to(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     buffer = ReplayBuffer(capacity=args.buffer)
     rng = np.random.default_rng(1)
@@ -272,6 +301,15 @@ def main() -> None:
         import pickle as _pickle
 
         demo_samples = _pickle.loads(Path(args.demos).read_bytes())
+        if is_factored(net) and demo_samples and isinstance(
+            demo_samples[0][1], np.ndarray
+        ):
+            raise SystemExit(
+                f"{args.demos} holds POSITIONAL pi targets, which cannot "
+                "supervise a factored net (a slot index binds to one state's "
+                "enumeration order, and the demo's action list was not "
+                "stored). Regenerate demos as CandidateSets, or drop --demos."
+            )
         demo_buffer = ReplayBuffer(capacity=len(demo_samples))
         demo_buffer.add(demo_samples)
         print(f"demo buffer: {len(demo_buffer)} expert samples from {args.demos} "
@@ -285,7 +323,9 @@ def main() -> None:
         print(f"curriculum pool: {len(snap_pool)} snapshots loaded")
 
     n_params = sum(p.numel() for p in net.parameters())
-    print(f"net: {n_params/1e6:.2f}M params | device: {device} | obs_dim: {net.torso[0].in_features}")
+    print(f"net: {type(net).__name__} {n_params/1e6:.2f}M params "
+          f"(factored={is_factored(net)}) | device: {device} "
+          f"| obs_dim: {net.torso[0].in_features}")
 
     for it in range(start_it, start_it + args.iters):
         t0 = time.perf_counter()

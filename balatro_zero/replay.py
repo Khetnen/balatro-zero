@@ -1,4 +1,10 @@
-"""Ring replay buffer over (Obs, pi_target, z_win, z_prog) samples."""
+"""Ring replay buffer over (Obs, policy_target, z_win, z_prog) samples.
+
+The policy target is a positional pi vector (np.ndarray, Discrete(500))
+for v3/v4 nets, or a targets.CandidateSet for factored (V5) nets. The
+buffer is format-agnostic; sample() stacks positional targets into one
+array and returns factored ones as a list for collate_candidate_sets.
+"""
 
 from __future__ import annotations
 
@@ -34,12 +40,13 @@ class ReplayBuffer:
     def sample(self, batch_size: int, rng: np.random.Generator):
         idx = rng.integers(0, len(self._obs), size=min(batch_size, len(self._obs)))
         flat, jid, cid, mid = stack_obs([self._obs[i] for i in idx])
+        pis = [self._pi[i] for i in idx]
         return (
             flat,
             jid,
             cid,
             mid,
-            np.stack([self._pi[i] for i in idx]),
+            np.stack(pis) if isinstance(pis[0], np.ndarray) else pis,
             np.asarray([self._z_win[i] for i in idx], dtype=np.float32),
             np.asarray([self._z_prog[i] for i in idx], dtype=np.float32),
         )
