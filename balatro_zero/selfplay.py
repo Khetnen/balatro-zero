@@ -23,6 +23,7 @@ with a single torch thread, returns samples + stats + new snapshots.
 from __future__ import annotations
 
 import pickle
+import zlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -231,6 +232,36 @@ def play_game(
         guided=guided,
     )
     return samples, stats, snapshots
+
+
+def eval_worker(
+    ckpt_path: str,
+    seeds: list[str],
+    cfg: SelfPlayConfig,
+) -> list[GameStats]:
+    """Spawn-safe eval worker: greedy games (no root noise) on fixed seeds.
+
+    Eval ran 16 games SERIALLY in the main process while self-play's 48
+    got a worker pool — an unlogged ~700s (70%) of every v11 iteration
+    once games stopped dying in ante 1. Per-seed rng derivation keeps
+    each eval game reproducible regardless of pooling or seed split.
+    """
+    torch.set_num_threads(1)
+    net = load_net(str(ckpt_path))
+    stats: list[GameStats] = []
+    for seed in seeds:
+        rng = np.random.default_rng(zlib.crc32(f"EVAL|{seed}".encode()))
+        try:
+            _, st, _ = play_game(
+                net, torch.device("cpu"), seed, cfg, rng, root_noise=False
+            )
+        except Exception as e:  # noqa: BLE001 — one bad game must not kill eval
+            import sys
+
+            print(f"[eval] game {seed} crashed: {e}", file=sys.stderr)
+            continue
+        stats.append(st)
+    return stats
 
 
 def _load_pool(path: str | None) -> list[bytes]:

@@ -45,6 +45,7 @@ from balatro_zero.targets import (
     collate_candidate_sets,
     encode_candidates,
     factored_policy_loss,
+    score_candidates,
 )
 from balatro_zero.train import train_epochs
 from jackdaw.env.action_space import ActionType
@@ -189,6 +190,28 @@ def main() -> int:
                                                  n_hands, real_lens)])
     check("V6 real candidate sets match", abs(ref - fast) < 1e-4,
           f"ref {ref:.6f} vs batched {fast:.6f}")
+
+    # Vectorized inference scorer (search._priors path) vs the per-action
+    # action_logit loop — must match at 1e-9, legacy AND global layouts.
+    print("1b. score_candidates == action_logit loop")
+    for label, snet, lens in (("V5 legacy", net, None), ("V6 global", PolicyValueNetV6(), (2, 1, 2))):
+        snet.eval()
+        t_lg, e_lg, c_lg, _ = evaluate_factored(snet, [obs_list[1]], torch.device("cpu"))
+        for acts_l, nh in ((action_lists[1], n_hands[1]), (edge_actions, 8), ([], 0)):
+            def _slot(a):
+                if lens is None:
+                    return None
+                s = global_entity_slot(a, lens)
+                return s if s is not None else -1
+            ref = np.array([action_logit(t_lg[0], e_lg[0], c_lg[0], a, nh,
+                                         ent_slot=_slot(a)) for a in acts_l])
+            fast = score_candidates(t_lg[0], e_lg[0], c_lg[0], acts_l, nh,
+                                    market_lens=lens)
+            ok = fast.shape == ref.shape and (
+                len(ref) == 0 or float(np.abs(ref - fast).max()) < 1e-9
+            )
+            check(f"{label}, {len(acts_l)} actions, n_hand={nh}", ok,
+                  "" if len(ref) == 0 else f"max delta {np.abs(ref - fast).max():.2e}")
 
     # ---- 2. gradient -------------------------------------------------------
     # A Dirichlet target is NOT representable by the factored family (the

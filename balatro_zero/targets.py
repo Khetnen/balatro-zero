@@ -50,13 +50,11 @@ class CandidateSet:
     n_hand: int             # live hand slots at the root
 
 
-def encode_candidates(
+def _encode_actions(
     actions: Sequence[Any],
-    pi: np.ndarray,
-    n_hand: int,
-    market_lens: tuple[int, int, int] | None = None,
-) -> CandidateSet:
-    """Compress a root's action list + improved policy into a CandidateSet.
+    market_lens: tuple[int, int, int] | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Per-candidate (types, entities, card bitmasks, has_cards) arrays.
 
     Mirrors ``net.action_logit``'s conventions exactly, so training and
     inference score identically: an entity slot outside the head's range
@@ -65,8 +63,8 @@ def encode_candidates(
     here, membership loop bounded there). A MacroPlan is scored by its
     opening move, like ``search._head_action``.
 
-    ``market_lens`` selects the entity layout and must match the net the
-    samples will train: None = legacy per-area index (V5); the root's
+    ``market_lens`` selects the entity layout and must match the net
+    being scored: None = legacy per-area index (V5); the root's
     ``net.market_area_lens(gs)`` = the global 28-slot layout (V6,
     GLOBAL_ENTITY nets), where the slot index is net.global_entity_slot.
     """
@@ -94,8 +92,62 @@ def encode_candidates(
                 if 0 <= int(c) < N_HAND_SLOTS:
                     m |= 1 << int(c)
             card_masks[i] = m
-    w = np.asarray(pi[:k], dtype=np.float32)
+    return types, entities, card_masks, has_cards
+
+
+def encode_candidates(
+    actions: Sequence[Any],
+    pi: np.ndarray,
+    n_hand: int,
+    market_lens: tuple[int, int, int] | None = None,
+) -> CandidateSet:
+    """Compress a root's action list + improved policy into a CandidateSet."""
+    types, entities, card_masks, has_cards = _encode_actions(actions, market_lens)
+    w = np.asarray(pi[: len(actions)], dtype=np.float32)
     return CandidateSet(types, entities, card_masks, has_cards, w, int(n_hand))
+
+
+def score_candidates(
+    type_lg: np.ndarray,
+    ent_lg: np.ndarray,
+    card_lg: np.ndarray,
+    actions: Sequence[Any],
+    n_hand: int,
+    market_lens: tuple[int, int, int] | None = None,
+) -> np.ndarray:
+    """Vectorized ``action_logit`` over a whole candidate list (float64).
+
+    One node evaluation scored ~400 candidates through per-action Python
+    calls (~9.4 ms vs 0.9 ms positional, measured 2026-08-12) — this is
+    the same factor composition as ``factored_policy_loss``, done once
+    in numpy. ``scripts/factored_loss_probe.py`` gates equivalence with
+    the per-action loop at 1e-9.
+    """
+    types, entities, card_masks, has_cards = _encode_actions(actions, market_lens)
+
+    def _lsm(z):
+        z = np.asarray(z, dtype=np.float64)
+        m = z.max()
+        return z - m - np.log(np.exp(z - m).sum())
+
+    lt = _lsm(type_lg)
+    le = _lsm(ent_lg)
+    s = lt[types.astype(np.int64)]
+    ev = entities >= 0
+    if ev.any():
+        s[ev] += le[entities[ev].astype(np.int64)]
+    if has_cards.any():
+        z = np.asarray(card_lg, dtype=np.float64)
+        lp_in = -np.logaddexp(0.0, -z)
+        lp_out = -np.logaddexp(0.0, z)
+        lim = min(int(n_hand), len(z))
+        if lim > 0:
+            bits = (
+                (card_masks[:, None].astype(np.int64) >> np.arange(lim)[None, :]) & 1
+            ).astype(np.float64)
+            card_term = bits @ lp_in[:lim] + (1.0 - bits) @ lp_out[:lim]
+            s = s + np.where(has_cards, card_term, 0.0)
+    return s
 
 
 @dataclass

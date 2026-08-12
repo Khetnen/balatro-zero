@@ -37,6 +37,7 @@ from balatro_zero.replay import ReplayBuffer
 from balatro_zero.selfplay import (
     GameStats,
     SelfPlayConfig,
+    eval_worker,
     play_game,
     sample_start_state,
     worker_run,
@@ -174,19 +175,28 @@ def run_selfplay(
     return samples, stats, new_snaps
 
 
-def evaluate_greedy(
-    net: PolicyValueNet,
-    device: torch.device,
+def evaluate_pooled(
+    ckpt_path: Path,
     *,
     n_games: int,
+    workers: int,
     cfg: SelfPlayConfig,
 ) -> list[GameStats]:
-    rng = np.random.default_rng(0)
-    stats = []
-    for i in range(n_games):
-        _, st, _ = play_game(net, device, f"EVAL{i}", cfg, rng, root_noise=False)
-        stats.append(st)
-    return stats
+    """Greedy eval on the fixed EVAL seeds, parallelized like self-play.
+
+    Reads the just-saved checkpoint (eval must see POST-training weights,
+    which is why the per-iteration ckpt is now saved before eval runs).
+    """
+    seeds = [f"EVAL{i}" for i in range(n_games)]
+    if workers <= 1:
+        return eval_worker(str(ckpt_path), seeds, cfg)
+    split = [seeds[i::workers] for i in range(workers)]
+    split = [s for s in split if s]
+    with get_context("spawn").Pool(processes=len(split)) as pool:
+        results = pool.starmap(
+            eval_worker, [(str(ckpt_path), s, cfg) for s in split]
+        )
+    return [st for r in results for st in r]
 
 
 def _summarize(stats: list[GameStats]) -> dict[str, float]:
@@ -229,6 +239,10 @@ def main() -> None:
     parser.add_argument("--buffer", type=int, default=60_000)
     parser.add_argument("--workers", type=int, default=0, help="0/1 = inline, else mp pool size")
     parser.add_argument("--eval-games", type=int, default=8)
+    parser.add_argument("--eval-every", type=int, default=2,
+                        help="run the greedy eval every N iterations (eval at n=16 "
+                             "is noisy anyway; serial per-iteration eval silently "
+                             "cost ~70%% of v11's wall time)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out", type=str, default="runs/default")
     parser.add_argument("--curriculum-frac", type=float, default=0.35,
@@ -371,12 +385,22 @@ def main() -> None:
         )
         t_train = time.perf_counter() - t1
 
-        net.to("cpu")
-        eval_stats = evaluate_greedy(net, torch.device("cpu"), n_games=args.eval_games, cfg=cfg)
-        net.to(device)
+        # Checkpoint BEFORE eval: eval workers load it from disk, and they
+        # must see POST-training weights (latest.pt holds pre-selfplay ones).
+        it_ckpt = out_dir / f"ckpt_{it:04d}.pt"
+        torch.save(net.state_dict(), it_ckpt)
+
+        eval_stats = None
+        t_eval = 0.0
+        if it % args.eval_every == 0 or it == start_it + args.iters - 1:
+            t2 = time.perf_counter()
+            eval_stats = evaluate_pooled(
+                it_ckpt, n_games=args.eval_games, workers=args.workers, cfg=cfg
+            )
+            t_eval = time.perf_counter() - t2
 
         sp = _summarize(sp_stats)
-        ev = _summarize(eval_stats)
+        ev = _summarize(eval_stats) if eval_stats is not None else None
         record = {
             "iter": it,
             "buffer": len(buffer),
@@ -385,15 +409,20 @@ def main() -> None:
             "losses": losses,
             "t_selfplay_s": round(t_sp, 1),
             "t_train_s": round(t_train, 1),
+            "t_eval_s": round(t_eval, 1),
         }
         with open(metrics_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
-        torch.save(net.state_dict(), out_dir / f"ckpt_{it:04d}.pt")
 
+        ev_str = (
+            f"eval: prog {ev['mean_progress']:.3f} ante {ev['mean_ante']:.2f} "
+            f"win {ev['win_rate']:.1%} ({t_eval:.0f}s)"
+            if ev is not None else "eval: —"
+        )
         print(
             f"[it {it:3d}] selfplay: prog {sp['mean_progress']:.3f} ante {sp['mean_ante']:.2f} "
             f"win {sp['win_rate']:.1%} ({args.games}g, {t_sp:.0f}s) "
-            f"| eval: prog {ev['mean_progress']:.3f} ante {ev['mean_ante']:.2f} win {ev['win_rate']:.1%} "
+            f"| {ev_str} "
             f"| loss p {losses['policy']:.3f} w {losses['win']:.3f} pr {losses['progress']:.3f} "
             f"| buf {len(buffer)} | pool {len(snap_pool)} (+{len(new_snaps)}, {sp['curriculum_games']:.0f} curr-g) "
             f"| guided {sp['guided_games']:.0f}g prog {sp['guided_mean_progress']:.2f} "

@@ -37,13 +37,12 @@ import torch
 from balatro_zero.goldprobe import plan_blind
 from balatro_zero.net import (
     PolicyValueNet,
-    action_logit,
     evaluate,
     evaluate_factored,
-    global_entity_slot,
     is_factored,
     market_area_lens,
 )
+from balatro_zero.targets import score_candidates
 from jackdaw.engine.actions import GamePhase
 
 from balatro_zero.state import (
@@ -250,19 +249,15 @@ def _priors(net, obs_list, states, action_lists, device):
     global_ent = getattr(net, "GLOBAL_ENTITY", False)
     out = []
     for i, acts in enumerate(action_lists):
-        n_hand = len(states[i].get("hand", []))
-        lens = market_area_lens(states[i]) if global_ent else None
-        row = []
-        for a in acts:
-            head = _head_action(a)
-            if global_ent:
-                s = global_entity_slot(head, lens)
-                slot = s if s is not None else -1  # -1: no entity factor
-            else:
-                slot = None  # legacy within-area convention
-            row.append(action_logit(tl[i], el[i], cl[i], head, n_hand,
-                                    ent_slot=slot))
-        out.append(np.asarray(row, dtype=np.float64))
+        # score_candidates is the vectorized action_logit (macro plans
+        # scored by their opening move, entity layout selected by
+        # market_lens) — the per-action Python loop here was 10x the
+        # positional net's cost per node evaluation.
+        out.append(score_candidates(
+            tl[i], el[i], cl[i], acts,
+            len(states[i].get("hand", [])),
+            market_lens=market_area_lens(states[i]) if global_ent else None,
+        ))
     return out, v
 
 
