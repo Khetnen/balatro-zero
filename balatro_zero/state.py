@@ -297,11 +297,30 @@ def _subsample(items: list[Any], budget: int) -> list[Any]:
     return [items[i] for i in sorted(indices)]
 
 
+def _forced_card_index(gs: dict[str, Any]) -> int | None:
+    """Cerulean Bell's auto-selected card, or None.
+
+    The engine rejects any play/discard that omits it (game.py
+    _require_forced_card, vanilla blind.lua:572-87 — the card cannot be
+    deselected in the real UI). jackdaw's action mask cannot express a
+    must-include constraint, so the enumerator must filter combos here;
+    before this, every rollout that reached a Cerulean Bell boss crashed
+    the game on an IllegalActionError (first seen v11, 2026-08-12 — the
+    engine check landed 2026-07-26, after the last self-play run).
+    """
+    for i, c in enumerate(gs.get("hand", [])):
+        ability = getattr(c, "ability", None)
+        if isinstance(ability, dict) and ability.get("forced_selection"):
+            return i
+    return None
+
+
 def legal_factored(gs: dict[str, Any]) -> list[FactoredAction]:
     """Enumerate legal FactoredActions (flat Discrete(500) convention)."""
     mask = get_action_mask(gs)
     actions: list[FactoredAction] = []
     type_mask = mask.type_mask
+    forced = _forced_card_index(gs)
 
     for t in range(len(type_mask)):
         if not type_mask[t] or t in _EXCLUDED_TYPES:
@@ -314,10 +333,16 @@ def legal_factored(gs: dict[str, Any]) -> list[FactoredAction]:
                     actions.append(FactoredAction(action_type=t, entity_target=int(idx)))
         elif t in _CARD_ONLY_TYPES:
             legal_cards = np.nonzero(mask.card_mask)[0]
-            combos = _subsample(
-                _card_combos(legal_cards, mask.min_card_select, mask.max_card_select),
-                CARD_COMBO_BUDGET,
-            )
+            combos = _card_combos(legal_cards, mask.min_card_select, mask.max_card_select)
+            if forced is not None:
+                # Play/Discard must include the forced card; combos without
+                # it are engine-illegal. Keep the unfiltered list only in
+                # the pathological case where the forced card is not even
+                # selectable (never observed; behaves as before the filter).
+                kept = [c for c in combos if forced in c]
+                if kept:
+                    combos = kept
+            combos = _subsample(combos, CARD_COMBO_BUDGET)
             for combo in combos:
                 actions.append(FactoredAction(action_type=t, card_target=combo))
         elif t == ActionType.UseConsumable:
