@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 
 from jackdaw.engine.actions import GamePhase
+from jackdaw.engine.data.blind_scaling import get_blind_target
 from jackdaw.engine.game import step as _engine_step
 from jackdaw.engine.rng import PseudoRandom
 from jackdaw.engine.run_init import initialize_run
@@ -93,11 +94,20 @@ HAND_FLAT_DIM: int = _ENTITY_INFO[0][2]    # 15
 _combo_rng = np.random.default_rng(0)
 
 
+# v13 progress annotations, maintained by step_factored on every step.
+# Both are OBSERVABLE HISTORY (the player knows their deepest ante and
+# best single-blind score), so determinize() correctly leaves them alone.
+_BZ_BEST = "_bz_best_blind_chips"   # C*: max chips scored in any one blind
+_BZ_FRONTIER = "_bz_frontier_ante"  # deepest ante reached (Hieroglyph-proof)
+
+
 def new_run(seed: str, back_key: str = "b_red", stake: int = 1) -> dict[str, Any]:
     """Fresh game state at blind select, mirroring DirectAdapter.reset."""
     gs = initialize_run(back_key, stake, seed)
     gs["phase"] = GamePhase.BLIND_SELECT
     gs["blind_on_deck"] = "Small"
+    gs[_BZ_BEST] = 0
+    gs[_BZ_FRONTIER] = 1
     return gs
 
 
@@ -153,6 +163,16 @@ def determinize(gs: dict[str, Any], rng: np.random.Generator) -> None:
 
 def step_factored(gs: dict[str, Any], action: FactoredAction) -> None:
     _engine_step(gs, factored_to_engine_action(action, gs))
+    # Maintain the v13 progress annotations. Chips retain the blind total
+    # from the clearing step until the next blind starts (start_round is
+    # what zeroes them), so the post-step max captures every blind's
+    # final score, including failed boss attempts.
+    c = gs.get("chips", 0)
+    if c > gs.get(_BZ_BEST, 0):
+        gs[_BZ_BEST] = c
+    a = gs.get("round_resets", {}).get("ante", 1)
+    if a > gs.get(_BZ_FRONTIER, 1):
+        gs[_BZ_FRONTIER] = a
 
 
 def is_terminal(gs: dict[str, Any]) -> bool:
@@ -184,24 +204,82 @@ def blinds_beaten(gs: dict[str, Any]) -> int:
     return gs.get("round", 0) - (1 if in_unresolved_blind(gs) else 0)
 
 
-def progress(gs: dict[str, Any]) -> float:
-    """Run progress in [0,1]: blinds beaten out of 24, plus fractional chip
-    progress toward the current blind. A won run is 1.0.
+def _standard_boss_req(gs: dict[str, Any], ante_n: int) -> int:
+    """The ante's effect-free boss bar: 2x base, stake/deck scaled.
 
-    This is the cold-start signal: identical all-zero outcome targets (no
-    game beats blind 1 early in training) give the value heads nothing to
-    rank states by; chip fractions differentiate games from the first
-    self-play batch onward.
+    Boss chip requirements trade off against boss EFFECTS (The Needle is
+    1x base because it allows one hand), so chips scored under normal
+    conditions must be measured against the effect-free standard bar —
+    the actual requirement is only honest ON the boss blind itself,
+    where the chips are being scored under the effect.
+    """
+    scaling = gs.get("modifiers", {}).get("scaling", 1)
+    ante_scaling = gs.get("starting_params", {}).get("ante_scaling", 1.0)
+    return get_blind_target(ante_n, "Boss", scaling, ante_scaling)
+
+
+def _frontier(gs: dict[str, Any]) -> int:
+    return max(gs.get(_BZ_FRONTIER, 1), ante(gs))
+
+
+def progress(gs: dict[str, Any]) -> float:
+    """Run progress in [0,1] (v13, 2026-08-13): ante-anchored frontier
+    position plus demonstrated chips against the frontier's boss bar.
+
+        progress = (f - 1 + frac) / 8,   f = deepest ante reached
+
+        frac = min(c  / A_f, .999)  on the frontier boss blind (live)
+               min(c  / S_f, .999)  on any other active blind (live)
+               min(C* / S_f, .999)  between blinds (high-water)
+
+    where c = chips this blind, C* = best single-blind chips this run
+    (absolute — percentages are computed at read time, so denominator
+    changes re-price automatically), S_f = the frontier's standard boss
+    bar and A_f the actual one.
+
+    Design properties (settled with the user; details in project memory):
+    the shaped signal is NEUTRAL to skips and to ante-1 vouchers — the
+    integer moves only at new-frontier boss kills, so no optional action
+    can farm or forfeit shaped progress; those tradeoffs live in the
+    value function. Raw live chips within a blind keep hand-root search
+    deltas (the v1 zero-variance and v4 flat-leaf lessons); the C* read
+    between blinds keeps econ-rollout realization at the round-advance
+    leaf. Numbers are NOT comparable to pre-v13 progress (blinds/24).
     """
     if won(gs):
         return 1.0
-    frac = 0.0
-    if in_unresolved_blind(gs):
-        blind = gs.get("blind")
-        target = getattr(blind, "chips", 0) if blind is not None else 0
-        if target > 0:
-            frac = min(gs.get("chips", 0) / target, 0.999)
-    return min((blinds_beaten(gs) + frac) / 24.0, 1.0)
+    f = _frontier(gs)
+    s_f = _standard_boss_req(gs, f)
+    blind = gs.get("blind")
+    if gs.get("phase") == GamePhase.SELECTING_HAND and blind is not None:
+        if ante(gs) == f and getattr(blind, "boss", False):
+            denom = getattr(blind, "chips", 0) or s_f
+        else:
+            denom = s_f
+        frac = min(gs.get("chips", 0) / denom, 0.999) if denom > 0 else 0.0
+    else:
+        frac = min(gs.get(_BZ_BEST, 0) / s_f, 0.999) if s_f > 0 else 0.0
+    return min((f - 1 + frac) / 8.0, 1.0)
+
+
+def progress_cap_read(gs: dict[str, Any]) -> float:
+    """Between-blind read with the live blind folded into the store.
+
+    For econ-rollout leaves that hit the step cap MID-blind: the root (a
+    shop state) reads C*/S_f, so a capped mid-blind leaf reading live
+    c/S_f would show a phantom progress LOSS that systematically punishes
+    multi-purchase shop lines (more buys = more rollout steps = capped
+    more often). Valuing such leaves at max(C*, c)/S_f removes the
+    regime artifact; within-blind discrimination is not the job at econ
+    roots, where the candidates being ranked are shop actions.
+    """
+    if won(gs):
+        return 1.0
+    f = _frontier(gs)
+    s_f = _standard_boss_req(gs, f)
+    best = max(gs.get(_BZ_BEST, 0), gs.get("chips", 0))
+    frac = min(best / s_f, 0.999) if s_f > 0 else 0.0
+    return min((f - 1 + frac) / 8.0, 1.0)
 
 
 def obs_vector(gs: dict[str, Any]) -> np.ndarray:

@@ -55,6 +55,7 @@ from balatro_zero.state import (
     legal_factored,
     observe,
     progress,
+    progress_cap_read,
     step_factored,
     won,
 )
@@ -138,7 +139,11 @@ def _batched_rollouts(
     training targets stay pure Monte Carlo).
     """
     root_beaten = blinds_beaten(gs)
-    max_steps = (max(depth, 14) if econ_root else depth)
+    # Econ rollouts should terminate BETWEEN blinds (the beat trigger
+    # below lands there); the step cap is a safety net, widened so
+    # multi-purchase shop lines rarely hit it mid-blind. Leaves that
+    # still do are valued with progress_cap_read (see below).
+    max_steps = (max(depth, 20) if econ_root else depth)
 
     states = []
     for a_idx in sim_specs:
@@ -228,7 +233,14 @@ def _batched_rollouts(
                        [states[i] for i in leaves],
                        [[] for _ in leaves], device)
         for row, i in enumerate(leaves):
-            values[i] = float(v[row]) + 0.5 * progress(states[i])
+            s = states[i]
+            prog = progress(s)
+            if econ_root and s.get("phase") == GamePhase.SELECTING_HAND:
+                # Cap-hit mid-blind: read as if the blind ended here, so
+                # the leaf competes on the store's regime with completed
+                # lines instead of eating a phantom live-read dip.
+                prog = max(prog, progress_cap_read(s))
+            values[i] = float(v[row]) + 0.5 * prog
     return values  # type: ignore[return-value]
 
 
