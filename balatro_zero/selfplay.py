@@ -151,7 +151,7 @@ def play_game(
             # DAgger-style: the router picks the econ action on the agent's
             # own visitation distribution; its choice becomes a one-hot
             # policy target. Hand play stays net+search.
-            legal = legal_factored(gs)
+            legal = legal_factored(gs, rng)
             scripted = scripted_econ_action(gs, legal)
             if scripted is not None:
                 try:
@@ -303,7 +303,14 @@ def _cached_net(ckpt_path: str) -> PolicyValueNet:
     key = (ckpt_path, os.stat(ckpt_path).st_mtime_ns)
     net = _NET_CACHE.get(key)
     if net is None:
-        _NET_CACHE.clear()  # a stale net is never wanted again
+        # Two slots, FIFO eviction: with eval overlapped into the next
+        # iteration's self-play, a worker legitimately serves two nets at
+        # once (latest.pt for self-play, ckpt_NNNN.pt for eval). Eviction
+        # must be bounded rather than path-keyed — every iteration's eval
+        # checkpoint is a NEW path, so per-path staleness would leak one
+        # net per eval iteration forever.
+        while len(_NET_CACHE) >= 2:
+            _NET_CACHE.pop(next(iter(_NET_CACHE)))
         net = load_net(ckpt_path)
         _NET_CACHE[key] = net
     return net

@@ -4,8 +4,17 @@ Each iteration:
   1. Self-play N games with the current net (Gumbel search) -> samples
   2. Add to replay buffer
   3. Train E epochs of minibatches over the buffer
-  4. Evaluate greedily (no root noise) on held-out seeds
-  5. Checkpoint (checkpoints double as the difficulty-reference ensemble)
+  4. Checkpoint (checkpoints double as the difficulty-reference ensemble)
+  5. Evaluate greedily (no root noise) on held-out seeds — in pooled mode
+     dispatched ASYNC: the eval games share the worker pool with the NEXT
+     iteration's self-play, which runs the very same weights (latest.pt is
+     saved from the same state dict as ckpt_it), so eval semantics are
+     unchanged but its wall time is hidden. The iteration's metrics row is
+     held until its eval resolves, so metrics.jsonl keeps its shape (eval
+     of ckpt_it in row it, rows in iteration order) and t_eval_s now means
+     "wall actually spent blocked on eval" (~0 when the overlap works). A
+     crash loses the held row along with its pending eval — one extra row
+     in the splice gap, nothing else.
 
 Run from the balatro-zero directory:
     uv run bzero --iters 50 --games 96 --workers 12
@@ -202,6 +211,27 @@ def evaluate_pooled(
     return [st for st in results if st is not None]
 
 
+def dispatch_eval(
+    ckpt_path: Path,
+    *,
+    n_games: int,
+    mp_pool: Pool,
+    cfg: SelfPlayConfig,
+):
+    """Submit the greedy eval to the pool WITHOUT waiting (starmap_async).
+
+    Called right after ckpt_it is saved; the games then share the pool
+    with iteration it+1's self-play, which runs the same weights, so the
+    eval's wall time is hidden behind work that had to happen anyway.
+    Per-seed rng derivation lives in eval_one_game, so the results are
+    identical to the synchronous path under any scheduling.
+    """
+    seeds = [f"EVAL{i}" for i in range(n_games)]
+    return mp_pool.starmap_async(
+        eval_one_game, [(str(ckpt_path), s, cfg) for s in seeds], chunksize=1
+    )
+
+
 def _summarize(stats: list[GameStats]) -> dict[str, float]:
     # Headline numbers use FRESH UNGUIDED games only — curriculum games start
     # deep and guided games get expert econ help, so mixing either would
@@ -358,6 +388,40 @@ def main() -> None:
         else None
     )
 
+    # Eval-overlap state (pooled mode): the record of an eval iteration is
+    # held here, unwritten, until its async eval resolves one iteration
+    # later — see the module docstring.
+    pending_eval = None
+    held_record = None
+
+    def _append_record(rec: dict) -> None:
+        with open(metrics_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def _resolve_held_eval() -> None:
+        """Block on the in-flight eval, fill its held record, append it."""
+        nonlocal pending_eval, held_record
+        if held_record is None:
+            return
+        t2 = time.perf_counter()
+        try:
+            stats = [st for st in pending_eval.get() if st is not None]
+        except Exception as e:  # noqa: BLE001 — a dead eval must not kill training
+            print(f"[eval] async eval for it {held_record['iter']} failed: {e}")
+            stats = []
+        waited = time.perf_counter() - t2
+        ev = _summarize(stats)
+        held_record["eval"] = ev
+        held_record["t_eval_s"] = round(waited, 1)
+        _append_record(held_record)
+        print(
+            f"    eval[it {held_record['iter']:3d}]: prog {ev['mean_progress']:.3f} "
+            f"ante {ev['mean_ante']:.2f} win {ev['win_rate']:.1%} "
+            f"(waited {waited:.0f}s)"
+        )
+        pending_eval = None
+        held_record = None
+
     for it in range(start_it, start_it + args.iters):
         t0 = time.perf_counter()
 
@@ -403,35 +467,45 @@ def main() -> None:
         it_ckpt = out_dir / f"ckpt_{it:04d}.pt"
         torch.save(net.state_dict(), it_ckpt)
 
-        eval_stats = None
-        t_eval = 0.0
-        if it % args.eval_every == 0 or it == start_it + args.iters - 1:
-            t2 = time.perf_counter()
-            eval_stats = evaluate_pooled(
-                it_ckpt, n_games=args.eval_games, mp_pool=mp_pool, cfg=cfg
-            )
-            t_eval = time.perf_counter() - t2
+        # The previous eval iteration's games have had this whole iteration
+        # (self-play + training) to finish on the pool; collect that row
+        # before this iteration's eval is dispatched.
+        _resolve_held_eval()
 
+        eval_due = it % args.eval_every == 0 or it == start_it + args.iters - 1
         sp = _summarize(sp_stats)
-        ev = _summarize(eval_stats) if eval_stats is not None else None
         record = {
             "iter": it,
             "buffer": len(buffer),
             "selfplay": sp,
-            "eval": ev,
+            "eval": None,
             "losses": losses,
             "t_selfplay_s": round(t_sp, 1),
             "t_train_s": round(t_train, 1),
-            "t_eval_s": round(t_eval, 1),
+            "t_eval_s": 0.0,
         }
-        with open(metrics_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-
-        ev_str = (
-            f"eval: prog {ev['mean_progress']:.3f} ante {ev['mean_ante']:.2f} "
-            f"win {ev['win_rate']:.1%} ({t_eval:.0f}s)"
-            if ev is not None else "eval: —"
-        )
+        if eval_due and mp_pool is not None:
+            pending_eval = dispatch_eval(
+                it_ckpt, n_games=args.eval_games, mp_pool=mp_pool, cfg=cfg
+            )
+            held_record = record  # appended by _resolve_held_eval
+            ev_str = "eval: dispatched"
+        elif eval_due:
+            t2 = time.perf_counter()
+            ev = _summarize(evaluate_pooled(
+                it_ckpt, n_games=args.eval_games, mp_pool=None, cfg=cfg
+            ))
+            t_eval = time.perf_counter() - t2
+            record["eval"] = ev
+            record["t_eval_s"] = round(t_eval, 1)
+            _append_record(record)
+            ev_str = (
+                f"eval: prog {ev['mean_progress']:.3f} ante {ev['mean_ante']:.2f} "
+                f"win {ev['win_rate']:.1%} ({t_eval:.0f}s)"
+            )
+        else:
+            _append_record(record)
+            ev_str = "eval: —"
         print(
             f"[it {it:3d}] selfplay: prog {sp['mean_progress']:.3f} ante {sp['mean_ante']:.2f} "
             f"win {sp['win_rate']:.1%} ({args.games}g, {t_sp:.0f}s) "
@@ -441,6 +515,10 @@ def main() -> None:
             f"| guided {sp['guided_games']:.0f}g prog {sp['guided_mean_progress']:.2f} "
             f"| train {t_train:.0f}s"
         )
+
+    # The final iteration's eval has no successor self-play to hide behind;
+    # collect it synchronously before tearing the pool down.
+    _resolve_held_eval()
 
     if mp_pool is not None:
         mp_pool.terminate()

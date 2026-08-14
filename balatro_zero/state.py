@@ -371,10 +371,18 @@ def _card_combos(
     return result
 
 
-def _subsample(items: list[Any], budget: int) -> list[Any]:
+def _subsample(
+    items: list[Any], budget: int, rng: np.random.Generator | None = None
+) -> list[Any]:
     if len(items) <= budget:
         return items
-    indices = _combo_rng.choice(len(items), size=budget, replace=False)
+    # The module-global fallback makes trajectories CALL-PATTERN-SENSITIVE
+    # (any earlier enumeration in the process advances the stream) — the
+    # documented scripted-probe-nondeterminism class. Callers that own a
+    # per-game generator (search, selfplay, eval) pass it here so their
+    # games are pure functions of (weights, seed, rng seed, config).
+    gen = rng if rng is not None else _combo_rng
+    indices = gen.choice(len(items), size=budget, replace=False)
     return [items[i] for i in sorted(indices)]
 
 
@@ -396,8 +404,14 @@ def _forced_card_index(gs: dict[str, Any]) -> int | None:
     return None
 
 
-def legal_factored(gs: dict[str, Any]) -> list[FactoredAction]:
-    """Enumerate legal FactoredActions (flat Discrete(500) convention)."""
+def legal_factored(
+    gs: dict[str, Any], rng: np.random.Generator | None = None
+) -> list[FactoredAction]:
+    """Enumerate legal FactoredActions (flat Discrete(500) convention).
+
+    ``rng`` feeds combo subsampling; None falls back to the module-global
+    stream (legacy behavior — context-sensitive, see _subsample).
+    """
     mask = get_action_mask(gs)
     actions: list[FactoredAction] = []
     type_mask = mask.type_mask
@@ -423,7 +437,7 @@ def legal_factored(gs: dict[str, Any]) -> list[FactoredAction]:
                 kept = [c for c in combos if forced in c]
                 if kept:
                     combos = kept
-            combos = _subsample(combos, CARD_COMBO_BUDGET)
+            combos = _subsample(combos, CARD_COMBO_BUDGET, rng)
             for combo in combos:
                 actions.append(FactoredAction(action_type=t, card_target=combo))
         elif t == ActionType.UseConsumable:
@@ -440,6 +454,7 @@ def legal_factored(gs: dict[str, Any]) -> list[FactoredAction]:
                         combos = _subsample(
                             _card_combos(legal_cards, min_cards, max_cards),
                             CARD_COMBO_BUDGET,
+                            rng,
                         )
                         for combo in combos:
                             actions.append(

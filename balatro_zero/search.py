@@ -205,7 +205,7 @@ def _batched_rollouts(
                                 break
                         depths[i] += 1
                         continue
-                acts = legal_factored(s)
+                acts = legal_factored(s, rng)
                 if not acts:
                     live.discard(i)  # dead-end — valued as leaf
                     break
@@ -308,7 +308,12 @@ def gumbel_search(
     macro_k: int = 0,
     determinize: bool = True,
 ) -> SearchResult | None:
-    actions: list[Any] = legal_factored(gs)
+    # The game's own rng feeds combo subsampling (root and every rollout
+    # step), so a trajectory is reproducible regardless of what else ran
+    # in the process — the module-global fallback made self-play and eval
+    # games call-pattern-sensitive (never bit-reproducible across harness
+    # variants; measured directly 2026-08-15).
+    actions: list[Any] = legal_factored(gs, rng)
     if macro_k > 1 and gs.get("phase") == GamePhase.SELECTING_HAND:
         plans = [p for p in plan_blind(gs, k=macro_k) if p]
         # Drop the primitive whose move a plan already opens with:
