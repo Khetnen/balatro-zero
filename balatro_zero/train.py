@@ -41,6 +41,8 @@ from balatro_zero.net import (
     PolicyValueNetV4,
     PolicyValueNetV5,
     PolicyValueNetV6,
+    PolicyValueNetV7,
+    _fit_flat,
     is_factored,
     load_net,
 )
@@ -58,7 +60,8 @@ from balatro_zero.selfplay import (
 from balatro_zero.targets import collate_candidate_sets, factored_policy_loss
 
 ARCHS = {"v3": PolicyValueNet, "v4": PolicyValueNetV4,
-         "v5": PolicyValueNetV5, "v6": PolicyValueNetV6}
+         "v5": PolicyValueNetV5, "v6": PolicyValueNetV6,
+         "v7": PolicyValueNetV7}
 
 
 def train_epochs(
@@ -95,7 +98,7 @@ def train_epochs(
                     for a, b in zip((flat, jid, cid, mid, z_win, z_prog),
                                     parts[:4] + parts[5:])
                 )
-            flat_t = torch.from_numpy(flat).float().to(device)
+            flat_t = _fit_flat(torch.from_numpy(flat).float().to(device), net)
             jid_t = torch.from_numpy(jid).to(device)
             cid_t = torch.from_numpy(cid).to(device)
             mid_t = torch.from_numpy(mid).to(device)
@@ -295,8 +298,9 @@ def main() -> None:
     parser.add_argument("--snapshot-min-ante", type=int, default=3)
     parser.add_argument("--pool-cap", type=int, default=300, help="max snapshots kept")
     parser.add_argument(
-        "--arch", choices=sorted(ARCHS), default="v6",
+        "--arch", choices=sorted(ARCHS), default="v7",
         help="network for FRESH runs (--resume sniffs the checkpoint instead): "
+             "v7 = v6 + the v14 observability obs (boss/tag/deck/hand/market), "
              "v6 = factored + pointer entity/card heads (content-bound), "
              "v5 = factored with positional-input heads, "
              "v3/v4 = positional Discrete(500)",

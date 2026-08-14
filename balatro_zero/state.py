@@ -13,12 +13,15 @@ FactoredAction of the current state.
 
 from __future__ import annotations
 
+import json
 import pickle
 from itertools import combinations
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+import jackdaw.engine as _jd_engine
 from jackdaw.engine.actions import GamePhase
 from jackdaw.engine.data.blind_scaling import get_blind_target
 from jackdaw.engine.game import step as _engine_step
@@ -32,7 +35,17 @@ from jackdaw.env.action_space import (
 )
 from jackdaw.env.balatro_spec import balatro_game_spec
 from jackdaw.env.game_spec import FactoredAction
-from jackdaw.env.observation import NUM_CENTER_KEYS, center_key_id, encode_observation
+from jackdaw.env.observation import (
+    _ENHANCEMENT_IDX,
+    _RANK_IDX,
+    _SUIT_IDX,
+    _TAG_IDX,
+    NUM_CENTER_KEYS,
+    NUM_RANKS,
+    NUM_TAGS,
+    center_key_id,
+    encode_observation,
+)
 
 MAX_ACTIONS = 500
 CARD_COMBO_BUDGET = 200
@@ -75,7 +88,7 @@ _EXCLUDED_TYPES = frozenset(
     )
 )
 
-OBS_DIM: int = (
+OBS_DIM_LEGACY: int = (
     _SPEC.global_feature_dim
     + sum(mc * fd for _, mc, fd in _ENTITY_INFO)
     + len(_ENTITY_INFO)
@@ -88,6 +101,112 @@ assert _ENTITY_INFO[0][0] == "hand_card", _ENTITY_INFO[0]
 HAND_FLAT_OFFSET: int = _SPEC.global_feature_dim
 HAND_FLAT_ROWS: int = _ENTITY_INFO[0][1]   # 8
 HAND_FLAT_DIM: int = _ENTITY_INFO[0][2]    # 15
+
+# --- v14 observability block (2026-08-14) ---------------------------------
+# Public state the player can see that the obs never carried, appended
+# STRICTLY AFTER the legacy layout so every pre-v14 offset stays valid and
+# any old checkpoint reads flat[:OBS_DIM_LEGACY] unchanged (evaluate_* and
+# train slice by the net's own in_features). All of it is observable
+# history / concrete public objects, so determinize() is untouched.
+#
+#   [boss]   one-hot of this ante's boss (round_resets.blind_choices["Boss"];
+#            the old v[26] blind-key scalar was identically ZERO — centers.json
+#            holds no bl_* keys — so every net v1-v13 was boss-blind)
+#   [tags]   the Small/Big SKIP-TAG OFFERS (blind_tags; the obs only ever
+#            had tags already OWNED — skips were chosen blind to the reward)
+#   [deck]   undrawn-deck suit x rank counts (/4, capped) + enhancement
+#            fractions (the live multiset is run-modified, NOT inferable
+#            from the discard histogram + 8 visible hand rows)
+#   [hand]   hand rows 9-16 (legacy flat truncates at 8; with hand-size
+#            vouchers the agent chose among invisible cards)
+#   [market] one content row PER MARKET SLOT, packed in observe()'s market
+#            order (shop cards | vouchers | boosters | pack), so a pointer
+#            head can BIND cost/edition/rank content to the slot it scores
+#            — pack playing cards all embed c_base, the documented V6
+#            residual. Row = [is_pack_card | shop-item or playing-card
+#            features, zero-padded].
+# Gate: scripts/observability_probe.py (zero-movement controls per piece).
+
+_BLINDS_PATH = Path(_jd_engine.__file__).resolve().parent / "data" / "blinds.json"
+with open(_BLINDS_PATH) as _f:
+    BLIND_KEYS: tuple[str, ...] = tuple(sorted(json.load(_f)))
+_BLIND_KEY_IDX: dict[str, int] = {k: i for i, k in enumerate(BLIND_KEYS)}
+N_BLIND_KEYS: int = len(BLIND_KEYS)  # 30
+
+N_DECK_HIST: int = len(_SUIT_IDX) * NUM_RANKS       # 52
+N_DECK_ENH: int = max(_ENHANCEMENT_IDX.values())    # 8 (m_bonus..m_lucky)
+EXTRA_HAND_ROWS: int = 8                            # hand slots 9-16
+MARKET_FEAT_DIM: int = 1 + HAND_FLAT_DIM            # flag + widest row (15)
+
+V14_BOSS_OFFSET: int = OBS_DIM_LEGACY
+V14_TAG_OFFSET: int = V14_BOSS_OFFSET + N_BLIND_KEYS
+V14_DECK_OFFSET: int = V14_TAG_OFFSET + 2 * NUM_TAGS
+EXTRA_HAND_OFFSET: int = V14_DECK_OFFSET + N_DECK_HIST + N_DECK_ENH
+MARKET_FEAT_OFFSET: int = EXTRA_HAND_OFFSET + EXTRA_HAND_ROWS * HAND_FLAT_DIM
+OBS_DIM: int = MARKET_FEAT_OFFSET + 12 * MARKET_FEAT_DIM  # 12 = N_MARKET_SLOTS
+
+
+def _v14_block(gs: dict[str, Any], entities: dict[str, Any]) -> np.ndarray:
+    """The appended public-state features; offsets local to the block."""
+    v = np.zeros(OBS_DIM - OBS_DIM_LEGACY, dtype=np.float32)
+    rr = gs.get("round_resets", {})
+
+    bi = _BLIND_KEY_IDX.get(rr.get("blind_choices", {}).get("Boss", ""))
+    if bi is not None:
+        v[bi] = 1.0
+
+    tags = rr.get("blind_tags", {})
+    tbase = N_BLIND_KEYS
+    for k, bname in enumerate(("Small", "Big")):
+        ti = _TAG_IDX.get(tags.get(bname, ""))
+        if ti is not None:
+            v[tbase + k * NUM_TAGS + ti] = 1.0
+
+    dbase = tbase + 2 * NUM_TAGS
+    deck: list[Any] = gs.get("deck") or []
+    n_deck = max(len(deck), 1)
+    for card in deck:
+        b = getattr(card, "base", None)
+        if b is not None:
+            suit = b.suit.value if hasattr(b.suit, "value") else str(b.suit)
+            rank = b.rank.value if hasattr(b.rank, "value") else str(b.rank)
+            si = _SUIT_IDX.get(suit)
+            ri = _RANK_IDX.get(rank)
+            if si is not None and ri is not None:
+                v[dbase + si * NUM_RANKS + ri] += 0.25
+        ei = _ENHANCEMENT_IDX.get(getattr(card, "center_key", ""), 0)
+        if ei > 0:
+            v[dbase + N_DECK_HIST + ei - 1] += 1.0 / n_deck
+    np.minimum(v[dbase:dbase + N_DECK_HIST], 1.0,
+               out=v[dbase:dbase + N_DECK_HIST])
+
+    hbase = dbase + N_DECK_HIST + N_DECK_ENH
+    hand_arr = entities.get("hand_card")
+    if hand_arr is not None and hand_arr.shape[0] > HAND_FLAT_ROWS:
+        extra = hand_arr[HAND_FLAT_ROWS:HAND_FLAT_ROWS + EXTRA_HAND_ROWS]
+        v[hbase:hbase + extra.shape[0] * HAND_FLAT_DIM] = (
+            np.asarray(extra, dtype=np.float32).ravel()
+        )
+
+    mbase = hbase + EXTRA_HAND_ROWS * HAND_FLAT_DIM
+    shop_arr = entities.get("shop_item")
+    pack_arr = entities.get("pack_card")
+    n_shop = (len(gs.get("shop_cards", [])) + len(gs.get("shop_vouchers", []))
+              + len(gs.get("shop_boosters", [])))
+    n_pack = len(gs.get("pack_cards", []))
+    for k in range(min(n_shop + n_pack, N_MARKET_SLOTS)):
+        row = mbase + k * MARKET_FEAT_DIM
+        if k < n_shop:
+            if shop_arr is not None and k < shop_arr.shape[0]:
+                r = shop_arr[k]
+                v[row + 1:row + 1 + r.shape[0]] = r
+        else:
+            v[row] = 1.0
+            p = k - n_shop
+            if pack_arr is not None and p < pack_arr.shape[0]:
+                r = pack_arr[p]
+                v[row + 1:row + 1 + r.shape[0]] = r
+    return v
 
 # Combo subsampling must be deterministic per process so a node enumerated
 # twice sees the same action list (targets/indices stay aligned).
@@ -298,6 +417,7 @@ def obs_vector(gs: dict[str, Any]) -> np.ndarray:
             counts.append(0.0)
         parts.append(padded.ravel())
     parts.append(np.asarray(counts, dtype=np.float32))
+    parts.append(_v14_block(gs, o.entities))
     return np.concatenate(parts)
 
 
@@ -310,6 +430,7 @@ N_EMBED = NUM_CENTER_KEYS + 1  # 0 = pad/unknown
 N_JOKER_SLOTS = 12
 N_CONSUMABLE_SLOTS = 4
 N_MARKET_SLOTS = 12  # shop cards + vouchers + boosters + open pack contents
+assert OBS_DIM == MARKET_FEAT_OFFSET + N_MARKET_SLOTS * MARKET_FEAT_DIM
 
 
 from dataclasses import dataclass  # noqa: E402

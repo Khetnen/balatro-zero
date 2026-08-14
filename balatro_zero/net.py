@@ -25,9 +25,13 @@ from torch import nn
 from jackdaw.env.action_space import ActionType
 
 from balatro_zero.state import (
+    EXTRA_HAND_OFFSET,
+    EXTRA_HAND_ROWS,
     HAND_FLAT_DIM,
     HAND_FLAT_OFFSET,
     HAND_FLAT_ROWS,
+    MARKET_FEAT_DIM,
+    MARKET_FEAT_OFFSET,
     MAX_ACTIONS,
     N_CONSUMABLE_SLOTS,
     N_EMBED,
@@ -376,6 +380,94 @@ class PolicyValueNetV6(PolicyValueNetV5):
         )
 
 
+class PolicyValueNetV7(PolicyValueNetV6):
+    """V6 on the v14 observability obs, with the two binding residuals closed.
+
+    v14 appends to the flat obs (see state.py's block comment): this
+    ante's boss one-hot, the Small/Big skip-tag offers, an undrawn-deck
+    histogram, hand rows 9-16, and a per-market-slot content row.
+    scripts/observability_probe.py is the falsifiable gate; the trained
+    v13 (V6, 614-dim) checkpoint is its zero-movement control, since the
+    appended block is invisible to any pre-v14 net by construction.
+
+    Head SHAPES are identical to V6 (type / 28 entity slots / 16 card
+    slots), so search, targets, and selfplay run unchanged; only what
+    content REACHES the heads differs:
+      * each market slot's pointer content adds a projection of its flat
+        row — a Standard-pack King and a plain 3 no longer score
+        identically (both embed c_base; V6 could only tell them apart by
+        slot position — binding_probe's defect class, narrower decision);
+        the same projection binds cost/edition to shop slots.
+      * the card pointer covers all 16 hand slots from content (appended
+        rows 9-16); the content-free card_tail bias is gone.
+    """
+
+    def __init__(self, obs_dim: int = OBS_DIM, n_actions: int = MAX_ACTIONS,
+                 hidden: int = 512, depth: int = 3, embed_dim: int = EMBED_DIM,
+                 d_model: int = 64, d_ptr: int = 64) -> None:
+        super().__init__(obs_dim, n_actions, hidden, depth, embed_dim,
+                         d_model, d_ptr)
+        del self.card_tail
+        self.card_pos = nn.Embedding(N_HAND_SLOTS, d_ptr)  # widen 8 -> 16
+        self.mkt_feat = nn.Linear(MARKET_FEAT_DIM, d_ptr)
+
+    def forward(self, flat, joker_ids, consumable_ids, market_ids):
+        h = self.torso(flat)
+        jtok, jpad, jempty = self.jokers.tokens(joker_ids)
+        keep = (~jpad).unsqueeze(-1).float()
+        count = keep.sum(dim=1).clamp(min=1.0)
+        jmean = (jtok * keep).sum(dim=1) / count
+        jmax = torch.where(keep > 0, jtok, torch.full_like(jtok, -1e9)).max(dim=1).values
+        jpool = torch.cat([jmean, jmax], dim=-1)
+        jpool = torch.where(jempty.unsqueeze(-1), torch.zeros_like(jpool), jpool)
+        pooled = torch.cat(
+            [
+                jpool,
+                _pool(self.embed(consumable_ids), consumable_ids),
+                _pool(self.embed(market_ids), market_ids),
+            ],
+            dim=-1,
+        )
+        h = self.fuse(torch.cat([h, pooled], dim=-1))
+
+        b = flat.shape[0]
+        mkt = flat[:, MARKET_FEAT_OFFSET:
+                   MARKET_FEAT_OFFSET + N_MARKET_SLOTS * MARKET_FEAT_DIM]
+        mkt = mkt.reshape(b, N_MARKET_SLOTS, MARKET_FEAT_DIM)
+        slots = torch.cat(
+            [
+                self.ent_proj_joker(jtok),
+                self.ent_proj_cons(self.embed(consumable_ids)),
+                self.ent_proj_market(self.embed(market_ids)) + self.mkt_feat(mkt),
+            ],
+            dim=1,
+        ) + self.ent_pos.weight.unsqueeze(0)
+        ent_lg = torch.einsum("bsd,bd->bs", slots, self.ent_query(h)) * self._scale
+
+        head = flat[:, HAND_FLAT_OFFSET:
+                    HAND_FLAT_OFFSET + HAND_FLAT_ROWS * HAND_FLAT_DIM]
+        tail = flat[:, EXTRA_HAND_OFFSET:
+                    EXTRA_HAND_OFFSET + EXTRA_HAND_ROWS * HAND_FLAT_DIM]
+        rows = torch.cat(
+            [head.reshape(b, HAND_FLAT_ROWS, HAND_FLAT_DIM),
+             tail.reshape(b, EXTRA_HAND_ROWS, HAND_FLAT_DIM)],
+            dim=1,
+        )
+        hand_slots = self.card_proj(rows) + self.card_pos.weight.unsqueeze(0)
+        card_lg = torch.einsum("bsd,bd->bs", hand_slots, self.card_query(h)) * self._scale
+
+        return (
+            self.type_head(h),
+            ent_lg,
+            card_lg,
+            torch.sigmoid(self.win(h)).squeeze(-1),
+            torch.sigmoid(self.progress(h)).squeeze(-1),
+        )
+
+
+assert N_HAND_SLOTS == HAND_FLAT_ROWS + EXTRA_HAND_ROWS
+
+
 # --- Global entity layout (V6) --------------------------------------------
 # One slot space shared by every entity-targeted action type, so no two
 # areas share a logit: [ jokers 0-11 | consumables 12-15 | market 16-27 ].
@@ -491,13 +583,29 @@ def action_logit(type_lg, ent_lg, card_lg, action, n_hand: int,
     return score
 
 
+def _fit_flat(flat: torch.Tensor, net: nn.Module) -> torch.Tensor:
+    """Slice the flat obs to the net's input width.
+
+    The v14 block is APPENDED, so a pre-v14 checkpoint's input is exactly
+    the prefix of today's obs — old difficulty-ladder rungs stay usable
+    on the current pipeline. A net wider than the obs is a real error.
+    """
+    w = net.torso[0].in_features
+    if flat.shape[1] == w:
+        return flat
+    if flat.shape[1] < w:
+        raise ValueError(f"obs width {flat.shape[1]} < net input {w}")
+    return flat[:, :w]
+
+
 @torch.no_grad()
 def evaluate_factored(net, obs, device):
     """Batch-evaluate -> (type_lg, entity_lg, card_lg, value) as numpy."""
     batch = stack_obs([obs] if isinstance(obs, Obs) else obs)
     flat, jid, cid, mid = (torch.from_numpy(np.ascontiguousarray(a)).to(device)
                            for a in batch)
-    t, e, c, pw, pg = net(flat.float(), jid, cid, mid)
+    flat = _fit_flat(flat.float(), net)
+    t, e, c, pw, pg = net(flat, jid, cid, mid)
     return (
         t.cpu().numpy(), e.cpu().numpy(), c.cpu().numpy(),
         combined_value(pw.cpu().numpy(), pg.cpu().numpy()),
@@ -512,14 +620,20 @@ def load_net(ckpt: str, device: str = "cpu") -> PolicyValueNet:
     than storing a flag, which old checkpoints would not have.
     """
     sd = torch.load(ckpt, map_location=device, weights_only=True)
-    if any(k.startswith("ent_query.") for k in sd):
-        net = PolicyValueNetV6()  # check before V5: V6 also has type_head
+    # obs_dim comes from the checkpoint, not the module constant: the v14
+    # obs append grew OBS_DIM, and pre-v14 rungs must build at their own
+    # width (evaluate_*/train slice the flat vector to in_features).
+    obs_dim = sd["torso.0.weight"].shape[1]
+    if any(k.startswith("mkt_feat.") for k in sd):
+        net = PolicyValueNetV7(obs_dim=obs_dim)
+    elif any(k.startswith("ent_query.") for k in sd):
+        net = PolicyValueNetV6(obs_dim=obs_dim)  # V6 also has type_head
     elif any(k.startswith("type_head.") for k in sd):
-        net = PolicyValueNetV5()
+        net = PolicyValueNetV5(obs_dim=obs_dim)
     elif any(k.startswith("jokers.") for k in sd):
-        net = PolicyValueNetV4()
+        net = PolicyValueNetV4(obs_dim=obs_dim)
     else:
-        net = PolicyValueNet()
+        net = PolicyValueNet(obs_dim=obs_dim)
     net.load_state_dict(sd)
     net.eval()
     return net
@@ -542,7 +656,7 @@ def evaluate(
     """Batch-evaluate observations -> (logits [B, A], value [B])."""
     batch = stack_obs([obs] if isinstance(obs, Obs) else obs)
     flat, jid, cid, mid = (torch.from_numpy(np.ascontiguousarray(a)).to(device) for a in batch)
-    logits, p_win, prog = net(flat.float(), jid, cid, mid)
+    logits, p_win, prog = net(_fit_flat(flat.float(), net), jid, cid, mid)
     return (
         logits.cpu().numpy(),
         combined_value(p_win.cpu().numpy(), prog.cpu().numpy()),
