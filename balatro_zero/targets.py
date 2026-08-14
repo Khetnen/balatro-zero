@@ -73,24 +73,32 @@ def _encode_actions(
     entities = np.full(k, -1, dtype=np.int8)
     card_masks = np.zeros(k, dtype=np.uint32)
     has_cards = np.zeros(k, dtype=bool)
+    # This loop runs once per candidate per node evaluation (~10^6 per
+    # self-play game) and was the single largest Python cost in the
+    # profile — hence the locals and the entity_target pre-check (most
+    # candidates are card combos with no entity factor at all).
+    ges = global_entity_slot
+    max_ent = MAX_ENTITY_SLOTS
+    n_slots = N_HAND_SLOTS
     for i, a in enumerate(actions):
-        head = a.seq[0] if hasattr(a, "seq") else a
+        seq = getattr(a, "seq", None)
+        head = a if seq is None else seq[0]
         types[i] = int(head.action_type)
-        if market_lens is not None:
-            g = global_entity_slot(head, market_lens)
-            if g is not None:
-                entities[i] = g
-        else:
-            e = head.entity_target
-            if e is not None and 0 <= int(e) < MAX_ENTITY_SLOTS:
-                entities[i] = int(e)
+        e = head.entity_target
+        if e is not None:
+            if market_lens is not None:
+                g = ges(head, market_lens)
+                if g is not None:
+                    entities[i] = g
+            elif 0 <= e < max_ent:
+                entities[i] = e
         tgt = head.card_target
-        if tgt is not None and len(tgt) > 0:
+        if tgt:
             has_cards[i] = True
             m = 0
             for c in tgt:
-                if 0 <= int(c) < N_HAND_SLOTS:
-                    m |= 1 << int(c)
+                if 0 <= c < n_slots:
+                    m |= 1 << c
             card_masks[i] = m
     return types, entities, card_masks, has_cards
 

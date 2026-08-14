@@ -22,6 +22,7 @@ with a single torch thread, returns samples + stats + new snapshots.
 
 from __future__ import annotations
 
+import os
 import pickle
 import zlib
 from dataclasses import dataclass
@@ -274,44 +275,106 @@ def _load_pool(path: str | None) -> list[bytes]:
         return []
 
 
-def worker_run(
+# ---------------------------------------------------------------------------
+# Persistent-pool workers (one task per GAME, dynamic load balancing)
+#
+# The old worker_run gave each worker a FIXED share of the iteration's
+# games, so selfplay wall was the slowest worker's share — and game
+# lengths vary ~30x (a 9-move ante-1 death vs a 100+-move ante-4 run),
+# which at ~3 games per worker made straggler waits a large fraction of
+# the phase. One task per game lets any free worker steal the queue, and
+# a pool that persists across iterations stops re-paying worker spawn
+# (torch import) every iteration. Net and snapshot pools are cached per
+# process, keyed by file mtime, so they load once per iteration each.
+# ---------------------------------------------------------------------------
+
+_NET_CACHE: dict[tuple[str, int], PolicyValueNet] = {}
+_POOL_CACHE: dict[tuple[str, int], list[bytes]] = {}
+
+
+def worker_init() -> None:
+    """Pool initializer: workers do single-thread CPU inference."""
+    torch.set_num_threads(1)
+
+
+def _cached_net(ckpt_path: str) -> PolicyValueNet:
+    # load_net sniffs the architecture from the state dict — constructing
+    # the base class here crashed outright on any V4/V5 checkpoint.
+    key = (ckpt_path, os.stat(ckpt_path).st_mtime_ns)
+    net = _NET_CACHE.get(key)
+    if net is None:
+        _NET_CACHE.clear()  # a stale net is never wanted again
+        net = load_net(ckpt_path)
+        _NET_CACHE[key] = net
+    return net
+
+
+def _cached_pool(path: str | None) -> list[bytes]:
+    if not path:
+        return []
+    try:
+        key = (path, os.stat(path).st_mtime_ns)
+    except OSError:
+        return []
+    pool = _POOL_CACHE.get(key)
+    if pool is None:
+        for k in [k for k in _POOL_CACHE if k[0] == path]:
+            del _POOL_CACHE[k]
+        pool = _load_pool(path)
+        _POOL_CACHE[key] = pool
+    return pool
+
+
+def play_one_game(
     ckpt_path: str,
-    n_games: int,
-    seed_prefix: str,
-    worker_id: int,
+    seed: str,
+    rng_seed: int,
     cfg: SelfPlayConfig,
     pool_path: str | None = None,
     seed_pool_path: str | None = None,
-) -> tuple[list[tuple[Obs, Any, float, float]], list[GameStats], list[bytes]]:
-    torch.set_num_threads(1)
-    device = torch.device("cpu")
-    # load_net sniffs the architecture from the state dict — constructing
-    # the base class here crashed outright on any V4/V5 checkpoint.
-    net = load_net(str(ckpt_path))
+) -> tuple[list[tuple[Obs, Any, float, float]], GameStats | None, list[bytes]]:
+    """One self-play game as a pool task; stats None if the game crashed.
 
-    pool = _load_pool(pool_path)
-    seed_pool = _load_pool(seed_pool_path)
+    The rng is derived from ``rng_seed`` alone, so a game's trajectory is
+    independent of which worker runs it and in what order — scheduling
+    stays free to balance load without touching reproducibility.
+    """
+    net = _cached_net(ckpt_path)
+    pool = _cached_pool(pool_path)
+    seed_pool = _cached_pool(seed_pool_path)
+    rng = np.random.default_rng(rng_seed)
+    start_state = sample_start_state(rng, cfg, pool, seed_pool)
+    guided = cfg.guided_frac > 0 and rng.random() < cfg.guided_frac
+    try:
+        return play_game(
+            net, torch.device("cpu"), seed, cfg, rng,
+            start_state=start_state, guided=guided,
+        )
+    except Exception as e:  # noqa: BLE001 — one bad game must not kill the run
+        import sys
+        import traceback
 
-    rng = np.random.default_rng(worker_id * 100_003 + 17)
-    all_samples: list[tuple[Obs, Any, float, float]] = []
-    stats: list[GameStats] = []
-    new_snapshots: list[bytes] = []
-    for i in range(n_games):
-        seed = f"{seed_prefix}W{worker_id}G{i}"
-        start_state = sample_start_state(rng, cfg, pool, seed_pool)
-        guided = cfg.guided_frac > 0 and rng.random() < cfg.guided_frac
-        try:
-            samples, st, snaps = play_game(
-                net, device, seed, cfg, rng, start_state=start_state, guided=guided
-            )
-        except Exception as e:  # noqa: BLE001 — one bad game must not kill the run
-            import sys
-            import traceback
+        print(f"[selfplay] game {seed} crashed: {e}", file=sys.stderr)
+        traceback.print_exc()
+        return [], None, []
 
-            print(f"[worker {worker_id}] game {seed} crashed: {e}", file=sys.stderr)
-            traceback.print_exc()
-            continue
-        all_samples.extend(samples)
-        stats.append(st)
-        new_snapshots.extend(snaps)
-    return all_samples, stats, new_snapshots
+
+def eval_one_game(
+    ckpt_path: str,
+    seed: str,
+    cfg: SelfPlayConfig,
+) -> GameStats | None:
+    """One greedy eval game as a pool task (rng derivation == eval_worker's,
+    so pooled eval numbers stay comparable with every earlier run)."""
+    net = _cached_net(ckpt_path)
+    rng = np.random.default_rng(zlib.crc32(f"EVAL|{seed}".encode()))
+    try:
+        _, st, _ = play_game(
+            net, torch.device("cpu"), seed, cfg, rng, root_noise=False
+        )
+    except Exception as e:  # noqa: BLE001 — one bad game must not kill eval
+        import sys
+
+        print(f"[eval] game {seed} crashed: {e}", file=sys.stderr)
+        return None
+    return st

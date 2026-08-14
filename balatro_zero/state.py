@@ -362,9 +362,12 @@ def _card_combos(
 ) -> list[tuple[int, ...]]:
     upper = min(len(legal_cards), max_select)
     lower = min(min_select, upper)
+    # One int conversion per card, not one per card per combo — combos of
+    # ~8 cards number in the hundreds and this runs at every rollout step.
+    cards = [int(c) for c in legal_cards]
     result: list[tuple[int, ...]] = []
     for k in range(lower, upper + 1):
-        result.extend(tuple(int(c) for c in combo) for combo in combinations(legal_cards, k))
+        result.extend(combinations(cards, k))
     return result
 
 

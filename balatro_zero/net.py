@@ -22,6 +22,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from jackdaw.env.action_space import ActionType
+
 from balatro_zero.state import (
     HAND_FLAT_DIM,
     HAND_FLAT_OFFSET,
@@ -395,6 +397,18 @@ def market_area_lens(gs) -> tuple[int, int, int]:
     )
 
 
+# Hot-loop constants for global_entity_slot: it runs once per candidate per
+# node evaluation (~10^6 calls per self-play game), so enum coercion and the
+# per-call import were measurable.
+_AT_SELL_JOKER = int(ActionType.SellJoker)
+_AT_SELL_CONSUMABLE = int(ActionType.SellConsumable)
+_AT_USE_CONSUMABLE = int(ActionType.UseConsumable)
+_AT_BUY_CARD = int(ActionType.BuyCard)
+_AT_REDEEM_VOUCHER = int(ActionType.RedeemVoucher)
+_AT_OPEN_BOOSTER = int(ActionType.OpenBooster)
+_AT_PICK_PACK_CARD = int(ActionType.PickPackCard)
+
+
 def global_entity_slot(action, lens: tuple[int, int, int]) -> int | None:
     """Map (action type, within-area entity index) -> global slot, or None.
 
@@ -403,24 +417,22 @@ def global_entity_slot(action, lens: tuple[int, int, int]) -> int | None:
     embedding the net saw. Out-of-window targets return None and the
     entity factor contributes nothing — same convention as everywhere.
     """
-    from jackdaw.env.action_space import ActionType
-
     e = action.entity_target
     if e is None:
         return None
     e = int(e)
     t = int(action.action_type)
-    if t == ActionType.SellJoker:
+    if t == _AT_SELL_JOKER:
         g = ENT_OFF_JOKER + e if e < N_JOKER_SLOTS else None
-    elif t in (ActionType.SellConsumable, ActionType.UseConsumable):
+    elif t == _AT_SELL_CONSUMABLE or t == _AT_USE_CONSUMABLE:
         g = ENT_OFF_CONS + e if e < N_CONSUMABLE_SLOTS else None
-    elif t == ActionType.BuyCard:
+    elif t == _AT_BUY_CARD:
         g = ENT_OFF_MARKET + e
-    elif t == ActionType.RedeemVoucher:
+    elif t == _AT_REDEEM_VOUCHER:
         g = ENT_OFF_MARKET + lens[0] + e
-    elif t == ActionType.OpenBooster:
+    elif t == _AT_OPEN_BOOSTER:
         g = ENT_OFF_MARKET + lens[0] + lens[1] + e
-    elif t == ActionType.PickPackCard:
+    elif t == _AT_PICK_PACK_CARD:
         g = ENT_OFF_MARKET + lens[0] + lens[1] + lens[2] + e
     else:
         return None

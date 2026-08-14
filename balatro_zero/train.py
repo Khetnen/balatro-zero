@@ -18,7 +18,9 @@ from __future__ import annotations
 import argparse
 import json
 import time
+import zlib
 from multiprocessing import get_context
+from multiprocessing.pool import Pool
 from pathlib import Path
 
 import numpy as np
@@ -37,10 +39,12 @@ from balatro_zero.replay import ReplayBuffer
 from balatro_zero.selfplay import (
     GameStats,
     SelfPlayConfig,
+    eval_one_game,
     eval_worker,
     play_game,
+    play_one_game,
     sample_start_state,
-    worker_run,
+    worker_init,
 )
 from balatro_zero.targets import collate_candidate_sets, factored_policy_loss
 
@@ -121,14 +125,14 @@ def run_selfplay(
     device: torch.device,
     *,
     n_games: int,
-    workers: int,
+    mp_pool: Pool | None,
     seed_prefix: str,
     cfg: SelfPlayConfig,
     rng: np.random.Generator,
     pool_path: Path | None = None,
     seed_pool_path: Path | None = None,
 ) -> tuple[list, list[GameStats], list[bytes]]:
-    if workers <= 1:
+    if mp_pool is None:
         import pickle as _pickle
 
         snap_pool: list[bytes] = []
@@ -152,25 +156,25 @@ def run_selfplay(
             new_snaps.extend(sn)
         return samples, stats, new_snaps
 
-    per_worker = [n_games // workers + (1 if i < n_games % workers else 0) for i in range(workers)]
-    ctx = get_context("spawn")
-    with ctx.Pool(workers) as pool:
-        results = pool.starmap(
-            worker_run,
-            [
-                (str(ckpt_path), pw, seed_prefix, wid, cfg,
-                 str(pool_path) if pool_path is not None else None,
-                 str(seed_pool_path) if seed_pool_path is not None else None)
-                for wid, pw in enumerate(per_worker)
-                if pw > 0
-            ],
-        )
+    # One task per game on the persistent pool: any free worker takes the
+    # next game, so the phase ends at (total work / workers) + one game's
+    # tail instead of waiting on the slowest fixed share. The per-game rng
+    # seed makes each game reproducible regardless of scheduling.
+    tasks = [
+        (str(ckpt_path), f"{seed_prefix}G{g}",
+         zlib.crc32(f"{seed_prefix}|G{g}".encode()), cfg,
+         str(pool_path) if pool_path is not None else None,
+         str(seed_pool_path) if seed_pool_path is not None else None)
+        for g in range(n_games)
+    ]
+    results = mp_pool.starmap(play_one_game, tasks, chunksize=1)
     samples = []
     stats = []
     new_snaps = []
     for s, st, sn in results:
         samples.extend(s)
-        stats.extend(st)
+        if st is not None:
+            stats.append(st)
         new_snaps.extend(sn)
     return samples, stats, new_snaps
 
@@ -179,24 +183,23 @@ def evaluate_pooled(
     ckpt_path: Path,
     *,
     n_games: int,
-    workers: int,
+    mp_pool: Pool | None,
     cfg: SelfPlayConfig,
 ) -> list[GameStats]:
     """Greedy eval on the fixed EVAL seeds, parallelized like self-play.
 
     Reads the just-saved checkpoint (eval must see POST-training weights,
     which is why the per-iteration ckpt is now saved before eval runs).
+    Per-seed rng derivation lives in eval_one_game/eval_worker, so the
+    numbers are identical under any scheduling.
     """
     seeds = [f"EVAL{i}" for i in range(n_games)]
-    if workers <= 1:
+    if mp_pool is None:
         return eval_worker(str(ckpt_path), seeds, cfg)
-    split = [seeds[i::workers] for i in range(workers)]
-    split = [s for s in split if s]
-    with get_context("spawn").Pool(processes=len(split)) as pool:
-        results = pool.starmap(
-            eval_worker, [(str(ckpt_path), s, cfg) for s in split]
-        )
-    return [st for r in results for st in r]
+    results = mp_pool.starmap(
+        eval_one_game, [(str(ckpt_path), s, cfg) for s in seeds], chunksize=1
+    )
+    return [st for st in results if st is not None]
 
 
 def _summarize(stats: list[GameStats]) -> dict[str, float]:
@@ -345,6 +348,16 @@ def main() -> None:
           f"(factored={is_factored(net)}) | device: {device} "
           f"| obs_dim: {net.torso[0].in_features}")
 
+    # One spawn pool for the whole run: workers persist across iterations
+    # (torch import paid once, not once per iteration per phase) and serve
+    # both self-play and eval. Workers are daemonic, so an abnormal exit
+    # still reaps them; the normal path terminates the pool after the loop.
+    mp_pool = (
+        get_context("spawn").Pool(args.workers, initializer=worker_init)
+        if args.workers > 1
+        else None
+    )
+
     for it in range(start_it, start_it + args.iters):
         t0 = time.perf_counter()
 
@@ -360,7 +373,7 @@ def main() -> None:
             net,
             torch.device("cpu"),
             n_games=args.games,
-            workers=args.workers,
+            mp_pool=mp_pool,
             seed_prefix=f"SP{it}",
             cfg=cfg,
             rng=rng,
@@ -395,7 +408,7 @@ def main() -> None:
         if it % args.eval_every == 0 or it == start_it + args.iters - 1:
             t2 = time.perf_counter()
             eval_stats = evaluate_pooled(
-                it_ckpt, n_games=args.eval_games, workers=args.workers, cfg=cfg
+                it_ckpt, n_games=args.eval_games, mp_pool=mp_pool, cfg=cfg
             )
             t_eval = time.perf_counter() - t2
 
@@ -428,6 +441,10 @@ def main() -> None:
             f"| guided {sp['guided_games']:.0f}g prog {sp['guided_mean_progress']:.2f} "
             f"| train {t_train:.0f}s"
         )
+
+    if mp_pool is not None:
+        mp_pool.terminate()
+        mp_pool.join()
 
 
 if __name__ == "__main__":
