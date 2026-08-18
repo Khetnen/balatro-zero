@@ -1,0 +1,193 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "play",
+      "description": "Play 1-5 cards from your hand as a poker hand. HAND stops only.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cards": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 5,
+            "description": "Card tokens from your hand, e.g. [\"Kh\", \"Qh\", \"Ts\"]. Use #N for duplicates: \"Kh#2\". Cards score left to right IN THIS ORDER — list xMult cards (Glass, Polychrome) last."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "Strategic reasoning: expected score vs pace requirement, why these cards."
+          }
+        },
+        "required": ["cards", "reasoning"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "discard",
+      "description": "Discard 1-5 cards and draw replacements. HAND stops only.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cards": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 5,
+            "description": "Card tokens to discard, e.g. [\"3c\", \"4d\"]."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "What you are digging for and why discarding beats a cycling play."
+          }
+        },
+        "required": ["cards", "reasoning"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "use_consumable",
+      "description": "Fire a held consumable (Tarot / Planet / Spectral) from your consumable slots. Targeting cards can only aim at hand cards, so fire those at a HAND stop.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "consumable": {
+            "type": "string",
+            "description": "Consumable key, e.g. \"c_death\". #N picks duplicates: \"c_strength#2\"."
+          },
+          "cards": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Hand-card tokens to target, for consumables that select cards. Omit for untargeted ones."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "Why now, and why these targets."
+          }
+        },
+        "required": ["consumable", "reasoning"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "sell",
+      "description": "Sell a joker or held consumable for its sell value. Legal at any stop, including mid-blind.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "item": {
+            "type": "string",
+            "description": "Joker or consumable key, e.g. \"j_egg\" or \"c_pluto\"."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "Why selling beats keeping (remember: sell value is half cost)."
+          }
+        },
+        "required": ["item", "reasoning"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "copy_card",
+      "description": "Death tarot only: convert target card into an exact copy of source card. Both must be in your hand; requires holding c_death. HAND stops only.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "Card token to copy FROM (this card survives unchanged)."
+          },
+          "target": {
+            "type": "string",
+            "description": "Card token that becomes a copy of source (its old identity is lost)."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "What duplicate this builds toward."
+          }
+        },
+        "required": ["source", "target", "reasoning"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "order_jokers",
+      "description": "Reorder your joker board (free, unlimited). Valid ONLY during a blind (HAND stop) or in the shop -- not at blind select or inside an open pack. List the keys in the desired left-to-right trigger order; listed jokers move to the front in that order, unlisted ones keep their relative order after them.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "order": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "description": "Joker keys left-to-right, e.g. [\"j_sly\", \"j_jolly\", \"j_duo\"]. +Chips/+Mult left, xMult right; Blueprint copies its RIGHT neighbor, Brainstorm copies the LEFTMOST joker."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "Which trigger interaction this order wins."
+          }
+        },
+        "required": ["order", "reasoning"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "choose",
+      "description": "Take one of the numbered options listed at an ECON stop (buy, open pack, reroll, select or skip blind, leave shop, untargeted pack pick, ...).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "option": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The option's index from the numbered list in the state message."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "Why this option beats the alternatives, including doing nothing."
+          }
+        },
+        "required": ["option", "reasoning"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "pick_pack_card",
+      "description": "Pick a card from an open booster pack and aim it at explicit targets among your dealt cards. Use this instead of choose whenever the pick is a targeting Tarot/Spectral, so it never fires on auto-targets.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "card": {
+            "type": "string",
+            "description": "Pack card key, e.g. \"c_strength\". #N picks duplicates."
+          },
+          "targets": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Dealt-card tokens to aim at (shown in the state block during pack opening)."
+          },
+          "reasoning": {
+            "type": "string",
+            "description": "Why this pick and these targets."
+          }
+        },
+        "required": ["card", "reasoning"]
+      }
+    }
+  }
+]

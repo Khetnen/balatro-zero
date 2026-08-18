@@ -67,7 +67,8 @@ DECISION_TYPES = {
 }
 
 HANDS = ["Flush", "Straight", "Two Pair", "Pair", "Three of a Kind",
-         "Full House", "Four of a Kind", "High Card", "Straight Flush", "Flush House"]
+         "Full House", "Four of a Kind", "High Card", "Straight Flush",
+         "Flush House", "Five of a Kind", "Flush Five"]
 
 HAND_TYPES = {h.lower(): h for h in [
     "High Card", "Pair", "Two Pair", "Three of a Kind", "Straight", "Flush",
@@ -109,6 +110,13 @@ def _record(ctl, gs, kind: str, entry: str, source: str, action=None) -> None:
         rec["action_type"] = int(action.action_type)
         rec["entity_target"] = action.entity_target
         rec["card_target"] = list(action.card_target or ())
+        # V6/V7 entity heads score ONE GLOBAL slot space whose market
+        # offsets depend on the live shop layout — resolvable only here,
+        # at decision time. -1 = no slot (hand actions, out-of-window).
+        from balatro_zero.net import global_entity_slot, market_area_lens
+
+        g = global_entity_slot(action, market_area_lens(gs))
+        rec["entity_global"] = -1 if g is None else int(g)
     if ctl.get("capture_pairs"):
         # Snapshot the observation BEFORE the action, in the same shape
         # bb_replay emits, so a harvested game feeds bc_pretrain unchanged
@@ -188,7 +196,10 @@ def parse_card_tokens(gs, text: str) -> list[int] | None:
     for tok in re.split(r"[\s,]+", text.strip()):
         if not tok:
             continue
-        t = tok.lower().replace("10", "t", 1)
+        # Accept annotated tokens (Kc[glass], Kh#2[steel]) by stripping the
+        # display-only bracket suffix: models copy labels verbatim, and the
+        # beam fallback's own act strings carry annotations too.
+        t = tok.lower().split("[")[0].replace("10", "t", 1)
         matches = [i for i, l in enumerate(labels)
                    if (l == t or l.split("#")[0] == t) and i not in out]
         if not matches:
@@ -333,7 +344,7 @@ def summary(gs, ctl) -> str:
                 lvls.append(f"{h} {chips}x{mult}")
             except Exception:  # noqa: BLE001
                 continue
-        lines.append("hand values: " + " | ".join(lvls[:8]))
+        lines.append("hand values: " + " | ".join(lvls))
     cards = gs.get("playing_cards") or gs.get("deck", [])
     suits: dict = {}
     for c in cards:
@@ -564,6 +575,12 @@ def _parse_hand_types(text: str) -> list[str] | None:
 
 def _order_jokers(gs, text: str) -> bool:
     """Bring named jokers to the front in the given order via free swaps."""
+    # The engine gates joker swaps to these two phases
+    # (game.py _handle_swap_jokers); anywhere else this must REJECT, not
+    # step -- an IllegalActionError here escapes apply_act's try/except.
+    if gs.get("phase") not in (GamePhase.SELECTING_HAND, GamePhase.SHOP):
+        print("order jokers only works during a blind or in the shop")
+        return False
     jokers = gs.get("jokers", [])
     refs: list = []
     for part in re.split(r"[,;]+", text):
@@ -578,12 +595,17 @@ def _order_jokers(gs, text: str) -> bool:
                   f"(board: {[key_of(j) for j in jokers]})")
             return False
         refs.append(matches[0])
-    for pos, ref in enumerate(refs):
-        cur = next(i for i, j in enumerate(jokers) if j is ref)
-        while cur > pos:
-            step_factored(gs, FactoredAction(
-                action_type=int(ActionType.SwapJokersLeft), entity_target=cur))
-            cur -= 1
+    try:
+        for pos, ref in enumerate(refs):
+            cur = next(i for i, j in enumerate(jokers) if j is ref)
+            while cur > pos:
+                step_factored(gs, FactoredAction(
+                    action_type=int(ActionType.SwapJokersLeft),
+                    entity_target=cur))
+                cur -= 1
+    except Exception as e:  # noqa: BLE001
+        print(f"order jokers failed mid-swap ({e})")
+        return False
     return True
 
 
@@ -624,8 +646,12 @@ def resolve_hand_act(gs, ctl, opts: list[dict], act: str):
         idxs = parse_card_tokens(gs, m.group(1))
         if idxs is None:
             return None, False
+        # Token order is preserved: the engine scores played cards in
+        # SELECTION order (game.py _handle_play_hand), so "play Ah Kh[glass]"
+        # vs "play Kh[glass] Ah" are different scores. Sorting here would
+        # silently take that control away.
         return FactoredAction(action_type=int(ActionType.PlayHand),
-                              card_target=tuple(sorted(idxs))), False
+                              card_target=tuple(idxs)), False
     if m := re.match(r"^discard\s+(.+)$", a, re.I):
         idxs = parse_card_tokens(gs, m.group(1))
         if idxs is None:
@@ -778,6 +804,24 @@ def apply_act(gs, ctl, kind: str, opts: list[dict], act: str,
         except Exception as e:  # noqa: BLE001
             print(f"ILLEGAL ({e}); state unchanged")
             return None
+    if m := re.match(r"^sell\s+(\S+)$", act.strip(), re.I):
+        # `sell <key>` from the tool path: consumable sells render as
+        # "SELLC <key>", which a plain substring match misses.
+        tok = m.group(1).lower().split("[")[0].split("#")[0]
+        hits = [i for i, o in enumerate(opts)
+                if o["kind"] != "freeform"
+                and o["desc"].lower().startswith(("sell ", "sellc "))
+                and tok in o["desc"].lower()]
+        if len({opts[i]["desc"] for i in hits}) == 1:
+            a = opts[hits[0]]["action"]
+            try:
+                entry = describe(gs, a)
+                _record(ctl, gs, kind, entry, "econ", a)
+                step_factored(gs, a)
+                return entry
+            except Exception as e:  # noqa: BLE001
+                print(f"ILLEGAL ({e}); state unchanged")
+                return None
     i = resolve_act([o["desc"] for o in opts if o["kind"] != "freeform"],
                     act, expect)
     if i is None:
