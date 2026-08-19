@@ -208,6 +208,17 @@ def play_game(
         a = ante(gs)
         max_ante_seen = max(max_ante_seen, a)
         max_progress = max(max_progress, progress(gs))
+        if won(gs):
+            # The episode ends at the win. The engine itself continues
+            # into endless mode, and a lost endless blind CLOBBERS the
+            # flag (game.py: gs["won"] = False at any GAME_OVER) — before
+            # this break, a game that beat the ante-8 boss and then died
+            # in ante 9+ was recorded as a LOSS with z_win = 0. Invisible
+            # while nothing ever won; found by the closeout probe
+            # (2026-08-18: 13 of its wins were flagged won=False at
+            # final_ante 9). Breaking here also keeps post-win states out
+            # of the curriculum snapshot pool below.
+            break
         if (
             a >= cfg.snapshot_min_ante
             and a > last_snap_ante
