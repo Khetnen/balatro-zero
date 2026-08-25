@@ -37,6 +37,8 @@ from balatro_zero.net import (
     load_net,
     market_area_lens,
 )
+from jackdaw.engine.actions import GamePhase
+
 from balatro_zero.router import ECON_PHASES, scripted_econ_action
 from balatro_zero.search import _apply, gumbel_search
 from balatro_zero.targets import encode_candidates
@@ -55,6 +57,13 @@ from balatro_zero.state import (
 )
 
 MAX_SNAPSHOTS_PER_GAME = 3
+
+# Guided (DAgger) games script only the shop and pack phases. BLIND_SELECT is
+# deliberately excluded: the router's default flags never skip a blind, so
+# one-hot SelectBlind targets would smuggle anti-skip supervision into the
+# policy head — the bias the skip-neutral v13 reward exists to avoid. The
+# skip/select decision stays net+search even in guided games.
+GUIDED_PHASES = frozenset(ECON_PHASES) - {GamePhase.BLIND_SELECT}
 
 
 @dataclass
@@ -147,7 +156,7 @@ def play_game(
 
     while not is_terminal(gs) and moves < cfg.max_moves:
         action = None
-        if guided and gs.get("phase") in ECON_PHASES:
+        if guided and gs.get("phase") in GUIDED_PHASES:
             # DAgger-style: the router picks the econ action on the agent's
             # own visitation distribution; its choice becomes a one-hot
             # policy target. Hand play stays net+search.
