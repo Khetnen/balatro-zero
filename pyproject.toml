@@ -12,9 +12,9 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-# Fork branch = upstream main + wheel packaging fix; swap to
-# TylerFlar/jackdaw-balatro once its PR #10 merges.
-jackdaw = { git = "https://github.com/Khetnen/jackdaw-balatro", branch = "packaging-data-files" }
+# Fork branch = upstream main + wheel packaging fix (PR #10) + hot-loop
+# perf (PR #11); swap to TylerFlar/jackdaw-balatro once both merge.
+jackdaw = { git = "https://github.com/Khetnen/jackdaw-balatro", branch = "bzero-pin" }
 torch = [
     { index = "pytorch-cu126", marker = "sys_platform == 'win32'" },
     { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
