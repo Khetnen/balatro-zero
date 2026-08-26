@@ -22,7 +22,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "jackdaw", editable = "../jackdaw-balatro" },
+    { name = "jackdaw", git = "https://github.com/Khetnen/jackdaw-balatro?branch=packaging-data-files" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "scipy", specifier = ">=1.18.0" },
     { name = "torch", marker = "sys_platform != 'linux' and sys_platform != 'win32'", specifier = ">=2.6" },
@@ -84,30 +84,10 @@ wheels = [
 [[package]]
 name = "jackdaw"
 version = "0.1.0"
-source = { editable = "../jackdaw-balatro" }
+source = { git = "https://github.com/Khetnen/jackdaw-balatro?branch=packaging-data-files#12f6a65510d99d3590519dfcfef674c92e38baf1" }
 dependencies = [
     { name = "gymnasium" },
     { name = "numpy" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "gymnasium", specifier = ">=1.0" },
-    { name = "numpy", specifier = ">=1.24" },
-    { name = "sb3-contrib", marker = "extra == 'train'", specifier = ">=2.3" },
-    { name = "stable-baselines3", marker = "extra == 'train'", specifier = ">=2.3" },
-    { name = "tensorboard", marker = "extra == 'train'", specifier = ">=2.14" },
-    { name = "torch", marker = "extra == 'train'", specifier = ">=2.0" },
-]
-provides-extras = ["train"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "httpx", specifier = ">=0.28.1" },
-    { name = "lupa", specifier = ">=2.6" },
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-cov", specifier = ">=6.0" },
-    { name = "ruff", specifier = ">=0.15.6" },
 ]
 
 [[package]]

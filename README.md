@@ -1,8 +1,8 @@
 # balatro-zero
 
 Gumbel expert-iteration (AlphaZero-style) agent for Balatro, built on the
-[jackdaw](../jackdaw-balatro) simulator (local clone, `local-fixes` branch —
-live-validated engine).
+[jackdaw](https://github.com/TylerFlar/jackdaw-balatro) simulator
+(live-validated engine; installed from upstream via `uv sync`).
 
 ## Why this design
 
