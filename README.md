@@ -67,8 +67,11 @@ uv run bzero --iters 400 --games 48 --workers 16 --sims 32 --depth 1 \
 ```
 
 The demo/seed-pool pickles are produced by the harvest pipeline
-(`scripts/llm_run.py` -> `scripts/demo_replay.py`); without them, omit the
-demo flags. Metrics stream to `<out>/metrics.jsonl`;
+(`scripts/llm_run.py` -> `scripts/demo_replay.py`). The harvested corpus —
+349 LLM-played games, 189 replay-verified wins — is published as the
+[llm-corpus-v1 release](https://github.com/Khetnen/balatro-zero/releases/tag/llm-corpus-v1)
+(CC0); unzip it into the repo and run `demo_replay.py` per its README to
+rebuild the pickles, or omit the demo flags to train without them. Metrics stream to `<out>/metrics.jsonl`;
 checkpoints to `<out>/ckpt_NNNN.pt`; `--resume` continues from
 `<out>/latest.pt`. Watch `eval mean_ante` — it should climb past 2-3 within
 the first dozens of iterations; `win_rate` stays ~0 until much later (a win
