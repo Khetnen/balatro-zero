@@ -2,11 +2,14 @@
 
 Gumbel expert-iteration (AlphaZero-style) agent for Balatro, built on the
 [jackdaw](https://github.com/TylerFlar/jackdaw-balatro) simulator
-(live-validated engine; installed from upstream via `uv sync`).
+(live-validated engine; installed automatically by `uv sync`). Self-play
+with search-improved policy targets, augmented with LLM demonstration
+wins — which turned out to be the ingredient that matters.
 
 ## Why this design
 
-- **Search + learned prior, not pure PPO**: taggarttufte/balatro-rl's
+- **Search + learned prior, not pure PPO**:
+  [taggarttufte/balatro-rl](https://github.com/taggarttufte/balatro-rl)'s
   shaped-reward PPO plateaued at 2.35% win rate and its scaling postmortem
   concluded the bottleneck is exploration/search, not capacity.
 - **Gumbel sequential halving** (Danihelka et al.) gives sound policy
@@ -14,12 +17,36 @@ Gumbel expert-iteration (AlphaZero-style) agent for Balatro, built on the
   Python simulator can afford.
 - **Two value heads** (P(win), normalized furthest-ante): early in training
   P(win) is ~0 everywhere; the ante head supplies the learning signal — a
-  value-space curriculum instead of misleading reward shaping.
+  value-space curriculum instead of misleading reward shaping. The progress
+  target uses a frontier formula (gate: `scripts/frontier_progress_probe.py`)
+  that pays for pushing past the run's best ante, fattening the deep tail.
+- **LLM demonstrations over pure self-play**: ~47k self-play games across
+  15 training generations produced zero wins. 189 replay-verified LLM
+  demonstration wins (harvested with `scripts/llm_run.py`), mixed into
+  training and used as a win-pool curriculum, produced the first wins this
+  project has ever seen. Win-grade economy play never emerged from
+  self-play alone.
 - **Pickle-based cloning** (~0.9ms/clone, 2x faster than deepcopy) is the
-  search's dominant cost; measured throughput math in the project memory.
+  search's dominant cost.
 - **Checkpoints are the product**: for seed-difficulty extraction, the
   ensemble of checkpoints at increasing strength serves as the
   reference-policy ladder (rollout win-rate/score distributions per seed).
+
+## Status (2026-08)
+
+- On a fixed-seed evaluation panel (`scripts/difficulty_eval.py`, mean
+  furthest-ante over K rollouts/seed): scripted chip-greedy baseline 1.65;
+  pure self-play nets shelved at 2.4-2.65 across many variants; the current
+  demo-trained net with router-guided economy reaches 2.92, edging past the
+  scripted expert router (2.79) for the first time.
+- From mid-run states of winning demonstration games, the current nets
+  convert ante-8 closeouts at up to ~37% (early generations: ~1%). Full-run
+  win rate is still ~0 — the binding gap is early-game (ante 1-4) build
+  quality, which is exactly what the demonstrations contain and self-play
+  doesn't discover.
+- Negative result worth knowing: fixing real observation blindness (boss
+  identity, skip tags — `--arch v7`) measurably changed nothing. Input
+  completeness was not the constraint; training signal was.
 
 ## Usage
 
@@ -27,29 +54,69 @@ Gumbel expert-iteration (AlphaZero-style) agent for Balatro, built on the
 # smoke test (inline, tiny)
 uv run bzero --iters 1 --games 2 --sims 8 --depth 0 --workers 0 --eval-games 2
 
-# real training run (12 worker processes, GPU training steps)
-uv run bzero --iters 200 --games 96 --workers 12 --sims 16 --depth 2 --out runs/v0
+# from-scratch training run
+uv run bzero --iters 200 --games 48 --workers 16 --sims 32 --depth 1 \
+    --epochs 4 --eval-games 16 --out runs/v0
+
+# the full current recipe: LLM demos + win-pool curriculum + guided economy
+uv run bzero --iters 400 --games 48 --workers 16 --sims 32 --depth 1 \
+    --epochs 4 --eval-games 16 --arch v7 \
+    --demos runs/demo_replay/demos_wins.pkl --demo-frac 0.2 \
+    --seed-pool runs/demo_replay/win_pool_a23456.pkl \
+    --guided-frac 0.25 --out runs/v19
 ```
 
-Metrics stream to `<out>/metrics.jsonl`; checkpoints to `<out>/ckpt_NNNN.pt`.
-Watch `eval mean_ante` — it should climb past 2-3 within the first dozens of
-iterations; `win_rate` stays ~0 until much later (a win requires beating
-ante 8).
+The demo/seed-pool pickles are produced by the harvest pipeline
+(`scripts/llm_run.py` -> `scripts/demo_replay.py`); without them the demo
+flags are simply omitted. Metrics stream to `<out>/metrics.jsonl`;
+checkpoints to `<out>/ckpt_NNNN.pt`; `--resume` continues from
+`<out>/latest.pt`. Watch `eval mean_ante` — it should climb past 2-3 within
+the first dozens of iterations; `win_rate` stays ~0 until much later (a win
+requires beating ante 8).
+
+## Repository tour
+
+`balatro_zero/` — the trainer: `state.py` (engine-facing game state +
+observation encoding), `net.py` (policy/value nets, `--arch v3`-`v7`; v6+
+use content-bound pointer heads), `search.py` (Gumbel sequential halving),
+`selfplay.py`, `targets.py` (factored policy/value targets), `router.py`
+(the scripted expert used as guide and yardstick), `goldprobe.py`
+(clairvoyant upper-anchor probe), `train.py`.
+
+`scripts/` highlights:
+
+- **LLM harvest**: `llm_run.py` (function-calling strategist for any
+  OpenAI-compatible endpoint; system prompt in `prompts/harvest_guide.md`),
+  `demo_replay.py` (bit-exact replay of harvested games -> training samples
+  + curriculum snapshots), `bc_pretrain.py` (behaviour-cloning pretrain).
+- **Falsifiable gates**: every risky mechanism has a probe that must move
+  before the mechanism ships — `binding_probe.py`, `determinize_probe.py`,
+  `observability_probe.py`, `factored_loss_probe.py`, `closeout_probe.py`,
+  and friends. `gold_rebaseline.py` is the run-before-long-sweeps canary.
+- **Difficulty extraction**: `difficulty_eval.py` (probe ladder x seed
+  panel), `difficulty_curves.py`, `difficulty_irt.py` (graded-response
+  fits).
+- **Misc**: `interactive_run.py` (human- or LLM-driven runs with beam
+  assistance), `bb_replay.py` / `bench5.py` (cross-checks against the
+  BalatroBench dataset), `seed_scout.py`, `route_harvest.py`.
 
 ## Known simplifications (deliberate, revisit later)
 
-- Search rollouts are **determinized** by default since 2026-08-11: each
-  simulation clone gets a fresh PRNG seed and a reshuffled undrawn deck
-  (`state.determinize`), so the agent plays under honest uncertainty.
-  `--clairvoyant` (train) / `params clairvoyant=True` (probes) restore the
-  old truth-peeking rollouts — which is how every checkpoint before that
-  date was trained and evaluated, so their recorded numbers are
-  clairvoyant numbers. The gold probe stays clairvoyant by design (it is
-  the difficulty ladder's upper anchor). The beam paths (`macro_k`,
-  `blind_finisher`) plan against the clone's sampled order — no longer
-  the true future, but still clairvoyant *within* their sample.
+- Search rollouts are **determinized**: each simulation clone gets a fresh
+  PRNG seed and a reshuffled undrawn deck (`state.determinize`), so the
+  agent plays under honest uncertainty. `--clairvoyant` restores
+  truth-peeking rollouts — only useful for comparisons against runs from
+  before determinization was the default (2026-08-11). The gold probe stays
+  clairvoyant by design (it is the difficulty ladder's upper anchor). The
+  beam paths (`macro_k`, `blind_finisher`) plan against the clone's sampled
+  order — no longer the true future, but still clairvoyant *within* their
+  sample.
 - No tree reuse below the root; rollouts are policy-greedy with depth cap.
 - Worker inference is per-position CPU; batched GPU inference across
   parallel games is the big future throughput win.
 - Flat Discrete(500) action slots (jackdaw's convention): slot semantics
   are state-dependent; card-combo enumeration subsampled at 200.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
