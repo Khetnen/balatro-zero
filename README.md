@@ -2,7 +2,8 @@
 
 Gumbel expert-iteration (AlphaZero-style) agent for Balatro, built on the
 [jackdaw](https://github.com/TylerFlar/jackdaw-balatro) simulator
-(live-validated engine; installed automatically by `uv sync`). Self-play
+(validated against the real game by lockstep differential replay; installed
+automatically by `uv sync`). Self-play
 with search-improved policy targets, plus supervised training on LLM
 demonstration wins.
 
@@ -17,7 +18,7 @@ demonstration wins.
   Python simulator can afford.
 - **Two value heads** (P(win), normalized furthest-ante): early in training
   P(win) is ~0 everywhere; the ante head supplies the learning signal — a
-  value-space curriculum instead of misleading reward shaping. The progress
+  curriculum in value space rather than in the reward. The progress
   target uses a frontier formula (gate: `scripts/frontier_progress_probe.py`)
   that only rewards progress past the run's best ante.
 - **LLM demonstrations**: ~47k self-play games across 15 training
@@ -27,9 +28,10 @@ demonstration wins.
   required to win does not appear in self-play data.
 - **Pickle-based cloning** (~0.9ms/clone, 2x faster than deepcopy) is the
   search's dominant cost.
-- **Checkpoints are the product**: for seed-difficulty extraction, the
-  ensemble of checkpoints at increasing strength serves as the
-  reference-policy ladder (rollout win-rate/score distributions per seed).
+- **A checkpoint ladder, not a single agent**: the end use is
+  seed-difficulty extraction, where checkpoints at increasing strength act
+  as the reference policies (rollout win-rate/score distributions per
+  seed).
 
 ## Status (2026-08)
 
@@ -102,9 +104,9 @@ use content-bound pointer heads), `search.py` (Gumbel sequential halving),
 ## Known simplifications (deliberate, revisit later)
 
 - Search rollouts are **determinized**: each simulation clone gets a fresh
-  PRNG seed and a reshuffled undrawn deck (`state.determinize`), so the
-  agent plays under honest uncertainty. `--clairvoyant` restores
-  truth-peeking rollouts — only useful for comparisons against runs from
+  PRNG seed and a reshuffled undrawn deck (`state.determinize`), so search
+  cannot see the run's actual future draws. `--clairvoyant` makes rollouts
+  replay the run's true RNG — only for comparisons against runs from
   before determinization was the default (2026-08-11). The gold probe stays
   clairvoyant by design (it is the difficulty ladder's upper anchor). The
   beam paths (`macro_k`, `blind_finisher`) plan against the clone's sampled
@@ -112,7 +114,7 @@ use content-bound pointer heads), `search.py` (Gumbel sequential halving),
   sample.
 - No tree reuse below the root; rollouts are policy-greedy with depth cap.
 - Worker inference is per-position CPU; batched GPU inference across
-  parallel games is the big future throughput win.
+  parallel games is the main remaining throughput optimization.
 - Flat Discrete(500) action slots (jackdaw's convention): slot semantics
   are state-dependent; card-combo enumeration subsampled at 200.
 
