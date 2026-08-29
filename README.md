@@ -26,8 +26,10 @@ demonstration wins.
   demonstration wins (harvested with `scripts/llm_run.py`) and using their
   states as a win-pool curriculum produced the first wins. The economy play
   required to win does not appear in self-play data.
-- **Pickle-based cloning** (~0.9ms/clone, 2x faster than deepcopy) is the
-  search's dominant cost.
+- **Pickle-based cloning** (~0.9ms/clone on deep states, 2x faster than
+  deepcopy) was the search's dominant cost when first profiled (2026-07).
+  Under the current stack (V7 net, factored actions, sims=32) it is ~7% of
+  self-play CPU, behind net inference and legal-move generation.
 - **A checkpoint ladder, not a single agent**: the end use is
   seed-difficulty extraction, where checkpoints at increasing strength act
   as the reference policies (rollout win-rate/score distributions per
